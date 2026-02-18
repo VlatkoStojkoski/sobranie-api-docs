@@ -2,7 +2,7 @@
 
 Reverse-engineer the undocumented [sobranie.mk](https://www.sobranie.mk) RPC-style web API into a high-quality OpenAPI 3.0 specification.
 
-The API multiplexes many logical methods through a single endpoint (`POST /Routing/MakePostRequest`) using a `MethodName` field. This CLI captures traffic, infers schemas, and lets you classify fields as enums or foreign keys to produce clean, typed specs.
+The API multiplexes many logical methods through a single endpoint (`POST /Routing/MakePostRequest`) using a `MethodName` field. This CLI captures traffic, infers schemas, and lets you classify fields (enum/fk/foreign-value/source roles) to produce clean, typed specs with relationship metadata.
 
 ## Quick start
 
@@ -36,18 +36,22 @@ pnpm start        # Interactive: new session or resume existing
 
 ```
 Record HAR (Dev Proxy) → Extract + Normalize → Infer Schemas (quicktype)
-→ Collect Values → Prompt User (enum/FK/scalar)
+→ Collect Values (scoped by method+side+path+field) → Prompt User
 → Transform Schemas → Validate → Emit OpenAPI
 ```
 
 1. **Record** — Dev Proxy captures `POST /Routing/MakePostRequest` traffic to a HAR file.
 2. **Extract + Normalize** — Parse HAR, normalize all keys to PascalCase, strip leading `/` from method names, group by `MethodName`.
 3. **Infer** — quicktype-core infers JSON Schemas from all request/response samples per method.
-4. **Collect Values** — Walk all samples, collect leaf values per key name, detect "suspects" (fields where any value repeats).
-5. **Prompt** — For each suspect: classify as scalar, enum, or foreign key. Match or create shared component definitions.
-6. **Transform** — Replace classified properties with `$ref` to shared components.
-7. **Validate** — Every sample must validate against its schema. Blocks emit until all pass.
-8. **Emit** — Multi-file OpenAPI output.
+4. **Collect Values** — Walk all samples and collect leaf values per scoped field key:
+   `method::request|response::parentPath::fieldName`.
+5. **Prompt** — For each suspect, classify as:
+   `scalar`, `enum`, `fk`, `foreign_value`, `index_source`, or `value_source`.
+   You can go back during prompting to undo the previous field.
+6. **Relationship checks** — Detect duplicate source declarations (hard gate) and unresolved refs (warnings).
+7. **Transform** — Inject `$ref` and `x-relationship` / `x-model-source` metadata.
+8. **Validate** — Every sample must validate against its schema. Blocks emit until all pass (unless forced).
+9. **Emit** — Multi-file OpenAPI output.
 
 ## Sessions
 
@@ -58,6 +62,7 @@ sessions/2025-02-16T14-30-00-000Z/
   har/input.har          # Captured HAR
   samples/               # Extracted request/response JSON per method
   decisions.json         # User decisions + shared components
+  relationship-conflicts.json   # Temporary conflict file (only when source conflicts exist)
   progress.json          # Current step, undo stack
   openapi/               # Generated spec
     openapi.yaml         # Root (path + schema $refs)
@@ -67,15 +72,32 @@ sessions/2025-02-16T14-30-00-000Z/
     openapi.bundled.json   # Single-file version
 ```
 
-Sessions can be resumed at any step. Undo reverts the last enum/FK decision.
+Sessions can be resumed at any step.
+During interactive prompting you can undo/go back to the previous field.
+Relationship warnings are saved in `progress.json`.
 
-## How enum/FK classification works
+## Classification Kinds
 
-- **Enum**: closed set of values. Emitted as `{ type: string, enum: [values] }`.
-- **Foreign Key**: reference to another entity. Emitted as `{ type: string|integer }` (no values listed).
 - **Scalar**: left as quicktype inferred it.
+- **Enum**: closed set of values.
+- **Foreign Key (`fk`)**: references a global field definition (e.g. `Committee.Id`).
+- **Foreign Value (`foreign_value`)**: references a global resolved/display field definition (e.g. `Committee.Title`).
+- **Index Source (`index_source`)**: marks the canonical source field for an `fk` definition.
+- **Value Source (`value_source`)**: marks the canonical source field for a `foreign_value` definition.
 
-Cross-method reuse: if a field's value set matches or overlaps an existing component, the CLI prompts to reuse or merge.
+Field IDs are editable and typically use dot notation, e.g. `Committee.Id`, `Committee.Title`.
+Different scoped fields can intentionally point to the same field ID.
+If multiple sources are marked for the same field ID, emit is blocked until resolved.
+
+## Relationship Metadata
+
+- Reference fields emit:
+  - `x-relationship: { role: "fk" | "foreign_value", field: "<FieldId>" }`
+- Source fields emit:
+  - `x-relationship: { role: "source", field: "<FieldId>" }`
+  - `x-model-source: { role: "source", field: "<FieldId>" }`
+
+Unresolved forward refs are allowed (emit continues) but warnings are printed and stored in `progress.json`.
 
 ## Guarantees
 
@@ -96,9 +118,11 @@ src/
   types.ts             # Shared types
   extract.ts           # HAR parsing + PascalCase normalization + grouping
   infer.ts             # quicktype-core schema inference
-  value-registry.ts    # Leaf value collection, suspect detection
+  value-registry.ts    # Leaf value collection + scoped suspect detection
+  scoped-field.ts      # Scoped decision key helpers
   decisions.ts         # Load/save decisions + shared components
-  schema-transform.ts  # Inject $ref for enum/FK fields
+  relationships.ts     # Relationship conflict/warning analysis
+  schema-transform.ts  # Inject $ref + x-relationship metadata
   validate.ts          # Ajv validation gate
   emit.ts              # Multi-file OpenAPI 3.0 emitter
 ```
@@ -112,6 +136,7 @@ src/
 | quicktype-core | JSON Schema inference from samples |
 | ajv | JSON Schema validation |
 | js-yaml | YAML output |
+| jsonpath-plus | Path-aware leaf extraction for scoped field keys |
 | tsx | TypeScript runner |
 
 ## Prerequisites

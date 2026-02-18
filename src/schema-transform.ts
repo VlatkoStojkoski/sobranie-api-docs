@@ -1,8 +1,9 @@
 /**
  * Schema Transform: apply user decisions to quicktype-inferred schemas.
  *
- * For each property in each method schema, if the user decided it's an
- * enum or FK, replace its inline schema with a $ref to the shared component.
+ * For each property in each method schema, apply scoped user decisions:
+ * - enum/fk/foreign_value => reference shared component + x-relationship metadata
+ * - index_source/value_source => keep inline schema + source metadata
  */
 
 import type {

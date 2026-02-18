@@ -1,5 +1,5 @@
 /**
- * Interactive prompts for user decisions (enum/FK/scalar classification).
+ * Interactive prompts for user decisions (scalar/enum/fk/foreign value/source roles).
  * Uses @inquirer/prompts for the interactive UI.
  */
 
