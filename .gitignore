@@ -1,0 +1,7 @@
+node_modules/
+dist/
+output/
+sessions/
+*.har
+!test/fixtures/*.har
+.archive

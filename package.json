@@ -1,0 +1,31 @@
+{
+  "name": "sobranie-mk-api-discovery",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.15.1",
+  "bin": {
+    "sobranie-cli": "./node_modules/.bin/tsx src/cli/index.ts"
+  },
+  "scripts": {
+    "cli": "tsx src/cli/index.ts",
+    "start": "tsx src/cli/index.ts start",
+    "new": "tsx src/cli/index.ts new",
+    "resume": "tsx src/cli/index.ts resume",
+    "sessions": "tsx src/cli/index.ts sessions",
+    "test": "tsx test/test-extract.ts && tsx test/test-infer.ts && tsx test/test-value-registry.ts && tsx test/test-decisions.ts && tsx test/test-transform-validate.ts && tsx test/test-emit.ts && tsx test/test-session.ts && tsx test/test-e2e.ts"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^8.2.1",
+    "ajv": "^8.17.0",
+    "commander": "^14.0.3",
+    "js-yaml": "^4.1.0",
+    "quicktype-core": "^23.0.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
