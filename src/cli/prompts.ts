@@ -35,7 +35,8 @@ function formatComponent(id: string, comp: SharedComponent): string {
 // ── Prompt for a single suspect ─────────────────────────────────────
 
 export interface PromptResult {
-  kind: FieldKind;
+  action: 'apply' | 'back';
+  kind?: FieldKind;
   componentId?: string;
   matchesExisting?: string;
 }
@@ -46,16 +47,17 @@ export async function promptForSuspect(
   index: number,
   total: number,
 ): Promise<PromptResult> {
-  const { keyName, entry } = suspect;
+  const { keyName, entry, methodName, direction } = suspect;
   const uniqueCount = entry.values.size;
   let totalOccurrences = 0;
   for (const c of entry.counts.values()) totalOccurrences += c;
 
   console.log(`\n[${ index + 1}/${total}] Field: ${keyName}`);
+  console.log(`  Method: ${methodName}  |  Side: ${direction}  |  Parent: ${suspect.parentPath}`);
   console.log(`  Unique values: ${uniqueCount}  |  Total occurrences: ${totalOccurrences}`);
   console.log(`  Values: ${formatValues(entry.values)}`);
 
-  // Check for overlapping existing components
+  // Check for overlapping existing components (enum-only reuse heuristic)
   const valuesArr = Array.from(entry.values);
   const overlaps = findOverlappingComponents(components, valuesArr);
 
@@ -66,21 +68,31 @@ export async function promptForSuspect(
     }
   }
 
-  const kind = await select<FieldKind>({
+  const kindSelection = await select<FieldKind | '__back__'>({
     message: `What is "${keyName}"?`,
     choices: [
+      { value: '__back__' as const, name: 'Go back to previous field (undo last decision)' },
       { value: 'scalar' as const, name: 'Scalar (plain string/number/boolean)' },
       { value: 'enum' as const, name: 'Enum (closed set of known values)' },
       { value: 'fk' as const, name: 'Foreign Key (reference to another entity)' },
+      { value: 'foreign_value' as const, name: 'Foreign Value (resolved/display value from another entity)' },
+      { value: 'index_source' as const, name: 'Index Source (actual source field for a foreign key)' },
+      { value: 'value_source' as const, name: 'Value Source (actual source field for a foreign value)' },
     ],
   });
 
-  if (kind === 'scalar') {
-    return { kind };
+  if (kindSelection === '__back__') {
+    return { action: 'back' };
   }
 
-  // For enum or FK, check if it matches an existing component
-  if (overlaps.length > 0) {
+  const kind = kindSelection;
+
+  if (kind === 'scalar') {
+    return { action: 'apply', kind };
+  }
+
+  // For enum, check if it matches an existing component
+  if (kind === 'enum' && overlaps.length > 0) {
     const matchExisting = await confirm({
       message: 'Does this match an existing component?',
       default: false,
@@ -113,48 +125,107 @@ export async function promptForSuspect(
         }
       }
 
-      return { kind, matchesExisting: matchId };
+      return { action: 'apply', kind, matchesExisting: matchId };
     }
   }
 
   // Determine base type from values
-  const baseType = inferBaseType(entry.values);
+  const inferredType = inferBaseType(entry.values);
 
-  // Create a new component
-  const autoId = generateComponentId(components, keyName, kind);
-  const componentId = await input({
-    message: `Component name:`,
-    default: autoId,
+  // Create or link a field definition.
+  const defaultFieldId = suggestFieldId(keyName, kind);
+  const fieldId = await input({
+    message: kind === 'enum' ? 'Component name:' : 'Field definition (e.g. Committee.Id):',
+    default: kind === 'enum' ? generateComponentId(components, keyName, kind) : defaultFieldId,
   });
 
-  const component: SharedComponent = {
-    kind,
-    baseType,
-    values: kind === 'enum' ? valuesArr.sort((a, b) => String(a).localeCompare(String(b))) : [],
-    description: kind === 'enum' ? `Enum for ${keyName}` : `Reference: ${keyName}`,
-  };
+  const existing = components[fieldId];
+  if (!existing) {
+    const component = componentForKind(kind, inferredType, valuesArr, keyName);
+    if (component) {
+      addComponent(components, fieldId, component);
+    }
+  }
 
-  addComponent(components, componentId, component);
-
-  return { kind, componentId };
+  return { action: 'apply', kind, componentId: fieldId };
 }
 
-function inferBaseType(values: Set<string | number | boolean>): string {
+function componentForKind(
+  kind: FieldKind,
+  inferredType: { baseType: string; baseTypes?: string[] },
+  values: (string | number | boolean)[],
+  keyName: string,
+): SharedComponent | null {
+  if (kind === 'scalar') return null;
+
+  const componentKind = (
+    kind === 'index_source' ? 'fk'
+      : kind === 'value_source' ? 'foreign_value'
+        : kind
+  );
+
+  return {
+    kind: componentKind,
+    baseType: inferredType.baseType,
+    ...(inferredType.baseTypes ? { baseTypes: inferredType.baseTypes } : {}),
+    values: componentKind === 'enum'
+      ? values.sort((a, b) => String(a).localeCompare(String(b)))
+      : [],
+    description: componentKind === 'enum'
+      ? `Enum for ${keyName}`
+      : componentKind === 'foreign_value'
+        ? `Foreign value: ${keyName}`
+        : `Reference: ${keyName}`,
+  };
+}
+
+function inferBaseType(
+  values: Set<string | number | boolean>,
+): { baseType: string; baseTypes?: string[] } {
   let hasString = false;
   let hasNumber = false;
   let hasInteger = true;
+  let hasBoolean = false;
 
   for (const v of values) {
     if (typeof v === 'string') hasString = true;
+    if (typeof v === 'boolean') hasBoolean = true;
     if (typeof v === 'number') {
       hasNumber = true;
       if (!Number.isInteger(v)) hasInteger = false;
     }
   }
 
-  if (hasString) return 'string';
-  if (hasNumber) return hasInteger ? 'integer' : 'number';
-  return 'string';
+  const baseTypes: string[] = [];
+  if (hasString) baseTypes.push('string');
+  if (hasNumber) baseTypes.push(hasInteger ? 'integer' : 'number');
+  if (hasBoolean) baseTypes.push('boolean');
+
+  if (baseTypes.length === 0) return { baseType: 'string' };
+  if (baseTypes.length === 1) return { baseType: baseTypes[0]! };
+  return { baseType: 'mixed', baseTypes };
+}
+
+function suggestFieldId(keyName: string, kind: FieldKind): string {
+  if (kind === 'enum') {
+    return keyName;
+  }
+
+  const bySuffix = (suffix: string): string | null => {
+    if (!keyName.endsWith(suffix) || keyName.length <= suffix.length) return null;
+    return keyName.slice(0, -suffix.length);
+  };
+
+  const idPrefix = bySuffix('Id');
+  if (idPrefix) return `${idPrefix}.Id`;
+
+  const titlePrefix = bySuffix('Title');
+  if (titlePrefix) return `${titlePrefix}.Title`;
+
+  const namePrefix = bySuffix('Name');
+  if (namePrefix) return `${namePrefix}.Name`;
+
+  return keyName.includes('.') ? keyName : `${keyName}.${keyName}`;
 }
 
 // ── Batch review (edit decisions JSON) ──────────────────────────────

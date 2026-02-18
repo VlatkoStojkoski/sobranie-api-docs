@@ -1,7 +1,13 @@
-/**
- * Test CLI session management: create, list, progress, HAR copy.
- */
-import { rm, readFile, stat, copyFile } from 'node:fs/promises';
+import assert from 'node:assert/strict';
+import {
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   createSession,
@@ -17,112 +23,87 @@ import {
   openApiDir,
 } from '../src/cli/session.js';
 
-async function main() {
-  console.log('=== Testing CLI session.ts ===\n');
+const FIXTURE_HAR = 'test/fixtures/sample.har';
 
-  let issues = 0;
-
-  // 1. Create session
-  const sessionDir = await createSession();
-  console.log(`  Created session: ${sessionDir}`);
-
-  // Check directories exist
-  for (const sub of ['har', 'samples', 'openapi']) {
-    try {
-      const s = await stat(join(sessionDir, sub));
-      if (!s.isDirectory()) throw new Error('not dir');
-    } catch {
-      console.error(`  FAIL: ${sub}/ not created`);
-      issues++;
-    }
-  }
-  console.log('  Subdirectories exist');
-
-  // Check progress.json
-  const progress = await loadProgress(sessionDir);
-  if (progress.step !== 'recording') {
-    console.error(`  FAIL: expected step 'recording', got '${progress.step}'`);
-    issues++;
-  }
-  console.log(`  Initial step: ${progress.step}`);
-
-  // Check devproxyrc.json was copied
-  try {
-    await stat(join(sessionDir, 'devproxyrc.json'));
-    console.log('  devproxyrc.json copied');
-  } catch {
-    console.log('  devproxyrc.json not copied (acceptable if not present)');
-  }
-
-  // 2. Update step
-  await updateStep(sessionDir, 'extracted');
-  const updated = await loadProgress(sessionDir);
-  if (updated.step !== 'extracted') {
-    console.error(`  FAIL: expected 'extracted', got '${updated.step}'`);
-    issues++;
-  }
-  console.log('  Step updated to extracted');
-
-  // 3. Save progress with undo stack
-  updated.undoStack = ['StatusTitle', 'CommitteeId'];
-  updated.nextPromptIndex = 5;
-  await saveProgress(sessionDir, updated);
-  const reloaded = await loadProgress(sessionDir);
-  if (reloaded.undoStack.length !== 2) {
-    console.error(`  FAIL: undo stack length ${reloaded.undoStack.length}`);
-    issues++;
-  }
-  if (reloaded.nextPromptIndex !== 5) {
-    console.error(`  FAIL: nextPromptIndex ${reloaded.nextPromptIndex}`);
-    issues++;
-  }
-  console.log('  Progress persistence OK');
-
-  // 4. Copy HAR to session
-  const testHar = 'test/fixtures/sample.har';
-  await copyHarToSession(testHar, sessionDir);
-  try {
-    const copied = await stat(harPath(sessionDir));
-    if (copied.size === 0) throw new Error('empty');
-    console.log('  HAR copied to session');
-  } catch {
-    console.error('  FAIL: HAR not copied');
-    issues++;
-  }
-
-  // 5. List sessions (should find at least one)
-  const sessions = await listSessions();
-  if (sessions.length === 0) {
-    console.error('  FAIL: no sessions found');
-    issues++;
-  } else {
-    console.log(`  Sessions found: ${sessions.length}`);
-    for (const s of sessions.slice(0, 3)) {
-      console.log(`    ${s.name} [${s.step}]`);
-    }
-  }
-
-  // 6. Helper paths
-  if (!samplesDir(sessionDir).includes('samples')) {
-    console.error('  FAIL: samplesDir wrong');
-    issues++;
-  }
-  if (!decisionsPath(sessionDir).includes('decisions.json')) {
-    console.error('  FAIL: decisionsPath wrong');
-    issues++;
-  }
-  if (!openApiDir(sessionDir).includes('openapi')) {
-    console.error('  FAIL: openApiDir wrong');
-    issues++;
-  }
-  console.log('  Path helpers OK');
-
-  // Cleanup
-  await rm(sessionDir, { recursive: true });
-  console.log('  Session cleaned up');
-
-  console.log(`\nIssues: ${issues}`);
-  console.log(`${issues === 0 ? 'PASS' : 'FAIL'}: CLI session.ts\n`);
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-main().catch(console.error);
+async function main(): Promise<void> {
+  const base = await mkdtemp(join(tmpdir(), 'session-test-'));
+  const sessionsRoot = join(base, 'sessions-root');
+  const originalSessionsDir = process.env.SOBRANIE_SESSIONS_DIR;
+  process.env.SOBRANIE_SESSIONS_DIR = sessionsRoot;
+
+  try {
+    const first = await createSession();
+    await delay(5);
+    const second = await createSession();
+
+    for (const dir of [first, second]) {
+      for (const sub of ['har', 'samples', 'openapi']) {
+        const subStat = await stat(join(dir, sub));
+        assert.equal(subStat.isDirectory(), true, `${sub} directory should exist`);
+      }
+
+      const progress = await loadProgress(dir);
+      assert.equal(progress.step, 'recording');
+      assert.deepEqual(progress.undoStack, []);
+    }
+
+    const sessions = await listSessions();
+    assert.equal(sessions.length, 2);
+    assert.equal(sessions[0]!.name > sessions[1]!.name, true, 'sessions should be sorted newest first');
+
+    await updateStep(first, 'inferred');
+    const updated = await loadProgress(first);
+    assert.equal(updated.step, 'inferred');
+
+    updated.undoStack = ['Status'];
+    updated.nextPromptIndex = 3;
+    await saveProgress(first, updated);
+    const reloaded = await loadProgress(first);
+    assert.deepEqual(reloaded.undoStack, ['Status']);
+    assert.equal(reloaded.nextPromptIndex, 3);
+
+    await copyHarToSession(FIXTURE_HAR, first);
+    const copiedHar = await stat(harPath(first));
+    assert.ok(copiedHar.size > 0);
+
+    const oldHar = join(first, 'devproxy-old.har');
+    const newHar = join(first, 'devproxy-new.har');
+    await writeFile(oldHar, '{}', 'utf-8');
+    await writeFile(newHar, '{}', 'utf-8');
+    await utimes(oldHar, new Date(1_000), new Date(1_000));
+    await utimes(newHar, new Date(2_000), new Date(2_000));
+    assert.equal(await findDevProxyHar(first), newHar, 'findDevProxyHar should return latest devproxy*.har');
+
+    assert.ok(samplesDir(first).endsWith('/samples'));
+    assert.ok(decisionsPath(first).endsWith('/decisions.json'));
+    assert.ok(openApiDir(first).endsWith('/openapi'));
+
+    await writeFile(join(first, 'progress.json'), '{broken', 'utf-8');
+    const fallback = await loadProgress(first);
+    assert.equal(fallback.step, 'recording', 'invalid progress json should fallback to default');
+
+    const missingFallback = await loadProgress(join(base, 'does-not-exist'));
+    assert.equal(missingFallback.step, 'recording', 'missing progress should fallback to default');
+
+    const progressRaw = await readFile(join(second, 'progress.json'), 'utf-8');
+    assert.ok(progressRaw.includes('recording'));
+
+    console.log('PASS test-session.ts');
+  } finally {
+    if (originalSessionsDir === undefined) {
+      delete process.env.SOBRANIE_SESSIONS_DIR;
+    } else {
+      process.env.SOBRANIE_SESSIONS_DIR = originalSessionsDir;
+    }
+    await rm(base, { recursive: true, force: true });
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

@@ -4,7 +4,7 @@
  */
 
 import { readFile, writeFile } from 'node:fs/promises';
-import type { Decisions, FieldDecision, SharedComponents, SharedComponent } from './types.js';
+import type { Decisions, FieldDecision, SharedComponents, SharedComponent, ScopeDirection } from './types.js';
 
 // ── Serializable format (JSON-friendly) ─────────────────────────────
 
@@ -35,8 +35,16 @@ export async function loadDecisions(path: string): Promise<{ decisions: Decision
   }
 }
 
-/** Optional reference for batch edit: keyName -> { values, uniqueCount, totalOccurrences } */
-export type SuspectReference = Record<string, { values: (string | number | boolean)[]; uniqueCount: number; totalOccurrences: number }>;
+/** Optional reference for batch edit: decisionKey -> metadata + values */
+export type SuspectReference = Record<string, {
+  methodName: string;
+  direction: ScopeDirection;
+  parentPath: string;
+  keyName: string;
+  values: (string | number | boolean)[];
+  uniqueCount: number;
+  totalOccurrences: number;
+}>;
 
 export async function saveDecisions(
   path: string,
@@ -128,6 +136,39 @@ export function mergeIntoComponent(
     existing.add(v);
   }
   comp.values = Array.from(existing).sort((a, b) => String(a).localeCompare(String(b)));
+
+  // Keep base type metadata aligned when merged values introduce new primitive types.
+  const mergedTypes = inferTypesFromValues(comp.values);
+  if (mergedTypes.length === 0) return;
+  if (mergedTypes.length === 1) {
+    comp.baseType = mergedTypes[0]!;
+    delete comp.baseTypes;
+  } else {
+    comp.baseType = 'mixed';
+    comp.baseTypes = mergedTypes;
+  }
+}
+
+function inferTypesFromValues(values: (string | number | boolean)[]): string[] {
+  let hasString = false;
+  let hasNumber = false;
+  let hasInteger = true;
+  let hasBoolean = false;
+
+  for (const value of values) {
+    if (typeof value === 'string') hasString = true;
+    if (typeof value === 'boolean') hasBoolean = true;
+    if (typeof value === 'number') {
+      hasNumber = true;
+      if (!Number.isInteger(value)) hasInteger = false;
+    }
+  }
+
+  const out: string[] = [];
+  if (hasString) out.push('string');
+  if (hasNumber) out.push(hasInteger ? 'integer' : 'number');
+  if (hasBoolean) out.push('boolean');
+  return out;
 }
 
 /**
@@ -137,9 +178,9 @@ export function mergeIntoComponent(
 export function generateComponentId(
   components: SharedComponents,
   keyName: string,
-  kind: 'enum' | 'fk',
+  kind: 'enum' | 'fk' | 'foreign_value',
 ): string {
-  const suffix = kind === 'enum' ? 'Enum' : 'Ref';
+  const suffix = kind === 'enum' ? 'Enum' : kind === 'foreign_value' ? 'Value' : 'Ref';
   const base = `${keyName}${suffix}`;
   if (!(base in components)) return base;
 

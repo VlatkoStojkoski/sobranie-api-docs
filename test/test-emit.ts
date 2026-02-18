@@ -1,110 +1,84 @@
-/**
- * Test emit.ts: multi-file OpenAPI output with real data.
- */
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { extractFromHar } from '../src/extract.js';
-import { inferSchemas } from '../src/infer.js';
+import { join } from 'node:path';
+import yaml from 'js-yaml';
 import { emitOpenApi } from '../src/emit.js';
-import type { SharedComponents } from '../src/types.js';
+import type { MethodSchema, SharedComponents } from '../src/types.js';
 
-const HAR_PATH = 'devproxy-normalized.har';
+async function main(): Promise<void> {
+  const outputDir = await mkdtemp(join(tmpdir(), 'emit-test-'));
 
-async function main() {
-  console.log('=== Testing emit.ts ===\n');
+  const schemas: MethodSchema[] = [
+    {
+      methodName: 'Get Members',
+      requestSchema: {
+        type: 'object',
+        properties: { MethodName: { type: 'string' } },
+      },
+      responseSchema: {
+        type: 'object',
+        properties: { Items: { type: 'array', items: { type: 'string' } } },
+      },
+    },
+    {
+      methodName: 'Get/Sessions?',
+      requestSchema: {
+        type: 'object',
+        properties: { Year: { type: 'integer' } },
+      },
+      responseSchema: {
+        type: 'object',
+        properties: { Total: { type: 'integer' } },
+      },
+    },
+  ];
 
-  const corpora = await extractFromHar(HAR_PATH);
-  const schemas = await inferSchemas(corpora);
-
-  // Add some shared components
   const components: SharedComponents = {
-    StatusTitleEnum: { kind: 'enum', baseType: 'string', values: ['Active', 'Closed'] },
-    CommitteeIdRef: { kind: 'fk', baseType: 'string', values: [] },
+    StatusEnum: { kind: 'enum', baseType: 'string', values: ['active', 'draft'] },
+    CommitteeIdRef: { kind: 'fk', baseType: 'integer', values: [] },
   };
 
-  const tmp = await mkdtemp(join(tmpdir(), 'test-emit-'));
-  let issues = 0;
+  try {
+    const result = await emitOpenApi(schemas, components, outputDir);
+    assert.ok(result.rootPath.endsWith('openapi.yaml'));
+    assert.equal(result.fileCount, 10, 'expected shared + per-method + root + bundled file count');
 
-  console.log('Emitting...');
-  const { rootPath, fileCount } = await emitOpenApi(schemas, components, tmp);
-  console.log(`  Root: ${rootPath}`);
-  console.log(`  Files: ${fileCount}`);
+    await stat(join(outputDir, 'openapi.yaml'));
+    await stat(join(outputDir, 'openapi.bundled.json'));
 
-  // Check root exists and is valid YAML
-  const rootContent = await readFile(rootPath, 'utf-8');
-  if (!rootContent.includes('openapi: 3.0.3')) {
-    console.error('  FAIL: root missing openapi version');
-    issues++;
+    const pathFiles = await readdir(join(outputDir, 'paths'));
+    assert.deepEqual(pathFiles.sort(), ['Get_Members.yaml', 'Get_Sessions_.yaml']);
+
+    const sharedFiles = await readdir(join(outputDir, 'schemas', 'shared'));
+    assert.deepEqual(sharedFiles.sort(), ['CommitteeIdRef.yaml', 'StatusEnum.yaml']);
+
+    const rootDoc = yaml.load(await readFile(join(outputDir, 'openapi.yaml'), 'utf-8')) as Record<string, any>;
+    assert.equal(rootDoc.openapi, '3.0.3');
+    assert.ok(rootDoc.paths['/rpc/Get_Members']);
+    assert.ok(rootDoc.paths['/rpc/Get_Sessions_']);
+    assert.equal(rootDoc.components.schemas.StatusEnum.$ref, 'schemas/shared/StatusEnum.yaml');
+
+    const bundled = JSON.parse(await readFile(join(outputDir, 'openapi.bundled.json'), 'utf-8')) as Record<string, any>;
+    assert.ok(bundled.paths['/rpc/Get_Members']);
+    assert.ok(bundled.paths['/rpc/Get_Sessions_']);
+    assert.ok(bundled.components.schemas.StatusEnum.enum.includes('active'));
+    assert.equal(bundled.components.schemas.CommitteeIdRef.type, 'integer');
+
+    const pathDoc = yaml.load(await readFile(join(outputDir, 'paths', 'Get_Sessions_.yaml'), 'utf-8')) as Record<string, any>;
+    assert.equal(pathDoc.post.operationId, 'Get_Sessions_');
+    assert.equal(
+      pathDoc.post.responses['200'].content['application/json'].schema.$ref,
+      '../schemas/Get_Sessions_/Response.yaml',
+    );
+
+    console.log('PASS test-emit.ts');
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
   }
-  if (!rootContent.includes('Sobranie.mk RPC API')) {
-    console.error('  FAIL: root missing title');
-    issues++;
-  }
-  console.log('  Root YAML valid');
-
-  // Check paths directory
-  const pathFiles = await readdir(join(tmp, 'paths'));
-  if (pathFiles.length !== schemas.length) {
-    console.error(`  FAIL: expected ${schemas.length} path files, got ${pathFiles.length}`);
-    issues++;
-  }
-  console.log(`  Path files: ${pathFiles.length}`);
-
-  // Check schema directories
-  const schemaDirs = await readdir(join(tmp, 'schemas'));
-  const methodDirs = schemaDirs.filter(d => d !== 'shared');
-  if (methodDirs.length !== schemas.length) {
-    console.error(`  FAIL: expected ${schemas.length} schema dirs, got ${methodDirs.length}`);
-    issues++;
-  }
-  console.log(`  Schema dirs: ${methodDirs.length} methods + shared`);
-
-  // Check shared dir has our components
-  const sharedFiles = await readdir(join(tmp, 'schemas', 'shared'));
-  if (sharedFiles.length !== 2) {
-    console.error(`  FAIL: expected 2 shared files, got ${sharedFiles.length}`);
-    issues++;
-  }
-  console.log(`  Shared files: ${sharedFiles.join(', ')}`);
-
-  // Check bundled JSON exists and has all methods
-  const bundledPath = join(tmp, 'openapi.bundled.json');
-  const bundled = JSON.parse(await readFile(bundledPath, 'utf-8'));
-  const bundledPaths = Object.keys(bundled.paths ?? {});
-  if (bundledPaths.length !== schemas.length) {
-    console.error(`  FAIL: bundled has ${bundledPaths.length} paths, expected ${schemas.length}`);
-    issues++;
-  }
-  const bundledSchemas = Object.keys(bundled.components?.schemas ?? {});
-  // Should have request + response per method + 2 shared
-  const expectedSchemas = schemas.length * 2 + 2;
-  if (bundledSchemas.length !== expectedSchemas) {
-    console.error(`  FAIL: bundled has ${bundledSchemas.length} schemas, expected ${expectedSchemas}`);
-    issues++;
-  }
-  console.log(`  Bundled JSON: ${bundledPaths.length} paths, ${bundledSchemas.length} schemas`);
-
-  // Spot check: a path file should reference the correct schema
-  const samplePathContent = await readFile(join(tmp, 'paths', 'GetMonthlyAgenda.yaml'), 'utf-8');
-  if (!samplePathContent.includes('GetMonthlyAgenda')) {
-    console.error('  FAIL: path file missing method reference');
-    issues++;
-  }
-  console.log('  Path content spot check OK');
-
-  // Spot check: a Request.yaml should have type info
-  const sampleReq = await readFile(join(tmp, 'schemas', 'GetMonthlyAgenda', 'Request.yaml'), 'utf-8');
-  if (!sampleReq.includes('type:')) {
-    console.error('  FAIL: request schema missing type');
-    issues++;
-  }
-  console.log('  Schema content spot check OK');
-
-  await rm(tmp, { recursive: true });
-
-  console.log(`\nIssues: ${issues}`);
-  console.log(`${issues === 0 ? 'PASS' : 'FAIL'}: emit.ts\n`);
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

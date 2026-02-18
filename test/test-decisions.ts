@@ -1,7 +1,5 @@
-/**
- * Test decisions.ts: load, save, round-trip, component helpers.
- */
-import { mkdtemp, rm } from 'node:fs/promises';
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -17,110 +15,88 @@ import {
   generateComponentId,
 } from '../src/decisions.js';
 
-async function main() {
-  console.log('=== Testing decisions.ts ===\n');
+async function main(): Promise<void> {
+  const dir = await mkdtemp(join(tmpdir(), 'decisions-test-'));
+  const file = join(dir, 'decisions.json');
 
-  const tmp = await mkdtemp(join(tmpdir(), 'test-decisions-'));
-  const path = join(tmp, 'decisions.json');
-  let issues = 0;
+  try {
+    const { decisions, components } = createEmptyDecisions();
 
-  // 1. Create empty, save, reload
-  let { decisions, components } = createEmptyDecisions();
+    setFieldDecision(decisions, 'Status', { kind: 'enum', componentId: 'StatusEnum' });
+    setFieldDecision(decisions, 'CommitteeId', { kind: 'fk', componentId: 'CommitteeIdRef' });
+    setFieldDecision(decisions, 'Title', { kind: 'scalar' });
 
-  setFieldDecision(decisions, 'StatusTitle', { kind: 'enum', componentId: 'StatusTitleEnum' });
-  setFieldDecision(decisions, 'CommitteeId', { kind: 'fk', componentId: 'CommitteeIdRef' });
-  setFieldDecision(decisions, 'Title', { kind: 'scalar' });
+    addComponent(components, 'StatusEnum', {
+      kind: 'enum',
+      baseType: 'string',
+      values: ['draft', 'active', 'closed'],
+    });
+    addComponent(components, 'StatusEnum2', {
+      kind: 'enum',
+      baseType: 'string',
+      values: ['active', 'paused'],
+    });
+    addComponent(components, 'CommitteeIdRef', {
+      kind: 'fk',
+      baseType: 'integer',
+      values: [],
+    });
 
-  addComponent(components, 'StatusTitleEnum', {
-    kind: 'enum', baseType: 'string', values: ['Active', 'Inactive', 'Pending'],
-  });
-  addComponent(components, 'CommitteeIdRef', {
-    kind: 'fk', baseType: 'string', values: [],
-  });
+    await saveDecisions(file, decisions, components, {
+      Status: { values: ['draft', 'active', 'closed'], uniqueCount: 3, totalOccurrences: 10 },
+    });
 
-  await saveDecisions(path, decisions, components);
-  console.log('  Saved decisions to disk');
+    const raw = JSON.parse(await readFile(file, 'utf-8')) as Record<string, unknown>;
+    assert.ok(raw._suspectValues, 'save should include optional suspect reference');
 
-  // 2. Reload
-  const loaded = await loadDecisions(path);
-  if (Object.keys(loaded.decisions.fields).length !== 3) {
-    console.error(`  FAIL: expected 3 fields, got ${Object.keys(loaded.decisions.fields).length}`);
-    issues++;
+    const loaded = await loadDecisions(file);
+    assert.equal(Object.keys(loaded.decisions.fields).length, 3);
+    assert.equal(Object.keys(loaded.components).length, 3);
+
+    const overlaps = findOverlappingComponents(loaded.components, ['active', 'draft']);
+    assert.deepEqual(
+      overlaps.map((o) => o.id),
+      ['StatusEnum', 'StatusEnum2'],
+      'overlap should be sorted by highest overlap and ignore fk components',
+    );
+    assert.equal(overlaps[0]!.overlapCount, 2);
+    assert.equal(overlaps[1]!.overlapCount, 1);
+
+    mergeIntoComponent(loaded.components, 'StatusEnum', ['active', 'archived']);
+    assert.deepEqual(
+      loaded.components.StatusEnum?.values,
+      ['active', 'archived', 'closed', 'draft'],
+      'merge should de-duplicate and sort values',
+    );
+
+    mergeIntoComponent(loaded.components, 'DoesNotExist', ['x']);
+
+    assert.equal(generateComponentId(loaded.components, 'Status', 'enum'), 'StatusEnum3');
+    assert.equal(generateComponentId(loaded.components, 'Language', 'enum'), 'LanguageEnum');
+    assert.equal(generateComponentId(loaded.components, 'CommitteeId', 'fk'), 'CommitteeIdRef2');
+    assert.equal(generateComponentId(loaded.components, 'TypeTitle', 'foreign_value'), 'TypeTitleValue');
+
+    removeFieldDecision(loaded.decisions, 'Title');
+    assert.ok(!('Title' in loaded.decisions.fields));
+    removeComponent(loaded.components, 'CommitteeIdRef');
+    assert.ok(!('CommitteeIdRef' in loaded.components));
+
+    const missing = await loadDecisions(join(dir, 'missing.json'));
+    assert.deepEqual(missing.decisions.fields, {}, 'missing file should return empty decisions');
+    assert.deepEqual(missing.components, {}, 'missing file should return empty components');
+
+    await writeFile(file, '{not json', 'utf-8');
+    const invalid = await loadDecisions(file);
+    assert.deepEqual(invalid.decisions.fields, {}, 'invalid JSON should return empty decisions');
+    assert.deepEqual(invalid.components, {}, 'invalid JSON should return empty components');
+
+    console.log('PASS test-decisions.ts');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
-  if (Object.keys(loaded.components).length !== 2) {
-    console.error(`  FAIL: expected 2 components, got ${Object.keys(loaded.components).length}`);
-    issues++;
-  }
-  if (loaded.decisions.fields['StatusTitle']?.kind !== 'enum') {
-    console.error('  FAIL: StatusTitle kind mismatch');
-    issues++;
-  }
-  console.log('  Reload round-trip OK');
-
-  // 3. Remove
-  removeFieldDecision(loaded.decisions, 'Title');
-  if ('Title' in loaded.decisions.fields) {
-    console.error('  FAIL: Title not removed');
-    issues++;
-  }
-  console.log('  Remove decision OK');
-
-  // 4. Component overlap
-  addComponent(loaded.components, 'TypeTitleEnum', {
-    kind: 'enum', baseType: 'string', values: ['Active', 'Closed'],
-  });
-
-  const overlaps = findOverlappingComponents(loaded.components, ['Active', 'Pending']);
-  if (overlaps.length !== 2) {
-    console.error(`  FAIL: expected 2 overlaps, got ${overlaps.length}`);
-    issues++;
-  } else {
-    // StatusTitleEnum has 2 overlap (Active, Pending), TypeTitleEnum has 1 (Active)
-    if (overlaps[0]!.overlapCount !== 2) {
-      console.error(`  FAIL: first overlap count expected 2, got ${overlaps[0]!.overlapCount}`);
-      issues++;
-    }
-  }
-  console.log('  Overlap detection OK');
-
-  // 5. Merge
-  mergeIntoComponent(loaded.components, 'StatusTitleEnum', ['Active', 'Dormant']);
-  const merged = loaded.components['StatusTitleEnum']!;
-  if (!merged.values.includes('Dormant')) {
-    console.error('  FAIL: Dormant not merged');
-    issues++;
-  }
-  if (merged.values.length !== 4) {
-    console.error(`  FAIL: expected 4 values after merge, got ${merged.values.length}`);
-    issues++;
-  }
-  console.log('  Merge OK');
-
-  // 6. Generate ID (collision avoidance)
-  const id1 = generateComponentId(loaded.components, 'StatusTitle', 'enum');
-  if (id1 !== 'StatusTitleEnum2') {
-    console.error(`  FAIL: expected StatusTitleEnum2, got ${id1}`);
-    issues++;
-  }
-  const id2 = generateComponentId(loaded.components, 'NewField', 'fk');
-  if (id2 !== 'NewFieldRef') {
-    console.error(`  FAIL: expected NewFieldRef, got ${id2}`);
-    issues++;
-  }
-  console.log('  ID generation OK');
-
-  // 7. Load nonexistent file
-  const empty = await loadDecisions(join(tmp, 'nonexistent.json'));
-  if (Object.keys(empty.decisions.fields).length !== 0) {
-    console.error('  FAIL: nonexistent file should return empty');
-    issues++;
-  }
-  console.log('  Nonexistent file load OK');
-
-  await rm(tmp, { recursive: true });
-
-  console.log(`\nIssues: ${issues}`);
-  console.log(`${issues === 0 ? 'PASS' : 'FAIL'}: decisions.ts\n`);
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

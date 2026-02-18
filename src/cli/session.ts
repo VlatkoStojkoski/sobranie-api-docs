@@ -7,14 +7,18 @@ import { mkdir, readdir, readFile, writeFile, copyFile, stat } from 'node:fs/pro
 import { join, resolve } from 'node:path';
 import type { SessionProgress, SessionStep } from '../types.js';
 
-const SESSIONS_DIR = 'sessions';
+const DEFAULT_SESSIONS_DIR = 'sessions';
 const DEVPROXY_CONFIG = 'devproxyrc.json';
+
+function getSessionsDir(): string {
+  return process.env.SOBRANIE_SESSIONS_DIR ?? DEFAULT_SESSIONS_DIR;
+}
 
 // ── Create ──────────────────────────────────────────────────────────
 
 export async function createSession(): Promise<string> {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const sessionDir = resolve(SESSIONS_DIR, timestamp);
+  const sessionDir = resolve(getSessionsDir(), timestamp);
 
   await mkdir(join(sessionDir, 'har'), { recursive: true });
   await mkdir(join(sessionDir, 'samples'), { recursive: true });
@@ -46,11 +50,11 @@ export interface SessionInfo {
 
 export async function listSessions(): Promise<SessionInfo[]> {
   try {
-    const entries = await readdir(SESSIONS_DIR);
+    const entries = await readdir(getSessionsDir());
     const sessions: SessionInfo[] = [];
 
     for (const name of entries) {
-      const sessionDir = resolve(SESSIONS_DIR, name);
+      const sessionDir = resolve(getSessionsDir(), name);
       try {
         const s = await stat(sessionDir);
         if (!s.isDirectory()) continue;

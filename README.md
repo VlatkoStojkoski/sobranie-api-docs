@@ -16,11 +16,21 @@ pnpm start        # Interactive: new session or resume existing
 | Command | Description |
 |---------|-------------|
 | `pnpm start` | Interactive menu: new or resume session |
+| `pnpm start -- --action new --har <path> --review-mode auto-scalar` | Fully parameterized non-interactive run |
 | `pnpm new` | Create a new session and run the pipeline |
 | `pnpm new --har <path>` | Create a session from an existing HAR file (skips recording) |
 | `pnpm resume` | Resume an existing session |
 | `pnpm sessions` | List all sessions |
 | `pnpm test` | Run full test suite |
+
+### Useful CLI options
+
+- `--sessions-dir <path>`: override where sessions are stored (default: `./sessions`)
+- `--review-mode <interactive|batch|auto-scalar>`: control suspect classification flow
+- `--assume-edited`: in batch mode, continue without confirmation prompt
+- `--force-on-validation-failure`: emit even when validation fails (non-interactive fallback)
+- `start --action <new|resume>`: skip menu selection
+- `resume --latest`: resume newest session without prompt
 
 ## Pipeline
 

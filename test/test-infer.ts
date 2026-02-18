@@ -1,63 +1,60 @@
-/**
- * Test infer.ts with real HAR data.
- * Extracts corpora, runs quicktype inference, checks output shapes.
- */
+import assert from 'node:assert/strict';
 import { extractFromHar } from '../src/extract.js';
 import { inferSchemas } from '../src/infer.js';
+import type { JsonSchema } from '../src/types.js';
 
-const HAR_PATH = 'devproxy-normalized.har';
+const FIXTURE_HAR = 'test/fixtures/sample.har';
 
-async function main() {
-  console.log('=== Testing infer.ts ===\n');
-
-  const corpora = await extractFromHar(HAR_PATH);
-  console.log(`Extracted ${corpora.length} methods\n`);
-
-  console.log('Inferring schemas...');
-  const schemas = await inferSchemas(corpora);
-
-  console.log(`\nSchemas inferred: ${schemas.length}`);
-
-  let issues = 0;
-  for (const schema of schemas) {
-    const hasReqType = schema.requestSchema.type || schema.requestSchema.anyOf || schema.requestSchema.oneOf;
-    const hasResType = schema.responseSchema.type || schema.responseSchema.anyOf || schema.responseSchema.oneOf || schema.responseSchema.properties;
-
-    if (!hasReqType) {
-      console.error(`  FAIL: ${schema.methodName} request schema has no type/anyOf/oneOf`);
-      issues++;
-    }
-    if (!hasResType) {
-      console.error(`  FAIL: ${schema.methodName} response schema has no type/anyOf/oneOf/properties`);
-      issues++;
-    }
-  }
-
-  // Spot check: GetMonthlyAgenda should have properties in its response
-  const agenda = schemas.find(s => s.methodName === 'GetMonthlyAgenda');
-  if (agenda) {
-    const hasItems = agenda.responseSchema.properties?.['Items'] ||
-                     agenda.responseSchema.items;
-    console.log(`\nSpot check GetMonthlyAgenda response:`);
-    console.log(`  type: ${agenda.responseSchema.type}`);
-    console.log(`  properties: ${Object.keys(agenda.responseSchema.properties ?? {}).length}`);
-    if (agenda.responseSchema.properties) {
-      console.log(`  keys: ${Object.keys(agenda.responseSchema.properties).slice(0, 10).join(', ')}`);
-    }
-  }
-
-  // Spot check: GetAllGenders should be simple
-  const genders = schemas.find(s => s.methodName === 'GetAllGenders');
-  if (genders) {
-    console.log(`\nSpot check GetAllGenders response:`);
-    console.log(`  type: ${genders.responseSchema.type}`);
-    if (genders.responseSchema.properties) {
-      console.log(`  keys: ${Object.keys(genders.responseSchema.properties).join(', ')}`);
-    }
-  }
-
-  console.log(`\nIssues: ${issues}`);
-  console.log(`${issues === 0 ? 'PASS' : 'FAIL'}: infer.ts\n`);
+function hasType(schema: JsonSchema, type: string): boolean {
+  if (schema.type === type) return true;
+  if (schema.anyOf) return schema.anyOf.some((s) => hasType(s, type));
+  if (schema.oneOf) return schema.oneOf.some((s) => hasType(s, type));
+  return false;
 }
 
-main().catch(console.error);
+async function main(): Promise<void> {
+  const empty = await inferSchemas([]);
+  assert.equal(empty.length, 0, 'empty corpora should infer no schemas');
+
+  const corpora = await extractFromHar(FIXTURE_HAR);
+  const schemas = await inferSchemas(corpora);
+
+  assert.equal(schemas.length, corpora.length, 'schema count should match method count');
+  assert.deepEqual(
+    schemas.map((s) => s.methodName),
+    corpora.map((c) => c.methodName),
+    'schema order should match corpus order',
+  );
+
+  for (const schema of schemas) {
+    assert.ok(schema.requestSchema.properties, `${schema.methodName} request should be object-like`);
+    assert.ok(schema.responseSchema.properties, `${schema.methodName} response should be object-like`);
+    assert.ok(
+      !JSON.stringify(schema.requestSchema).includes('"$schema"') &&
+      !JSON.stringify(schema.responseSchema).includes('"$schema"'),
+      'OpenAPI conversion should remove draft-only $schema metadata',
+    );
+  }
+
+  const getSessions = schemas.find((s) => s.methodName === 'GetSessions');
+  assert.ok(getSessions, 'GetSessions schema should exist');
+  const bodyIdSchema = getSessions.requestSchema.properties?.BodyId as JsonSchema | undefined;
+  assert.ok(bodyIdSchema, 'GetSessions request should contain BodyId');
+  assert.ok(hasType(bodyIdSchema, 'integer'), 'BodyId should allow integer');
+  assert.ok(hasType(bodyIdSchema, 'null'), 'BodyId should allow null');
+
+  const searchContent = schemas.find((s) => s.methodName === 'SearchContent');
+  assert.ok(searchContent, 'SearchContent schema should exist');
+  const resultsSchema = searchContent.responseSchema.properties?.Results as JsonSchema | undefined;
+  assert.equal(resultsSchema?.type, 'array', 'SearchContent.Results should be an array');
+  const resultItem = resultsSchema?.items as JsonSchema | undefined;
+  assert.ok(resultItem?.properties?.Type, 'SearchContent result items should have Type');
+  assert.ok(resultItem?.properties?.Snippet, 'SearchContent result items should have Snippet');
+
+  console.log('PASS test-infer.ts');
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

@@ -1,11 +1,21 @@
 /**
- * Value Registry: collect all observed leaf values per keyName across all methods.
- * Used to detect suspects (fields that might be enums or foreign keys).
+ * Value Registry: collect all observed leaf values per scoped field key.
+ * Scope = method + request/response side + parent path + field name.
  *
  * A field is "suspect" if at least one value appears more than once.
  */
 
-import type { MethodCorpus, ValueRegistry, ValueEntry } from './types.js';
+import { JSONPath } from 'jsonpath-plus';
+import type { MethodCorpus, ValueRegistry, ValueEntry, ScopeDirection } from './types.js';
+import { makeScopedFieldKey } from './scoped-field.js';
+
+const EXCLUDED_SUSPECT_KEYS = new Set(['MethodName']);
+
+interface JsonPathMatch {
+  value: unknown;
+  parentProperty?: string | number;
+  pointer?: string;
+}
 
 // ── Build registry from all samples ─────────────────────────────────
 
@@ -14,60 +24,107 @@ export function buildValueRegistry(corpora: MethodCorpus[]): ValueRegistry {
 
   for (const corpus of corpora) {
     for (const sample of corpus.samples) {
-      collectLeafValues(sample.request, registry);
-      collectLeafValues(sample.response, registry);
+      collectLeafValues(sample.request, registry, corpus.methodName, 'request');
+      collectLeafValues(sample.response, registry, corpus.methodName, 'response');
     }
   }
 
   return registry;
 }
 
-function collectLeafValues(value: unknown, registry: ValueRegistry): void {
+function collectLeafValues(
+  value: unknown,
+  registry: ValueRegistry,
+  methodName: string,
+  direction: ScopeDirection,
+): void {
   if (value === null || value === undefined) return;
 
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      collectLeafValues(item, registry);
+  const matches = JSONPath({
+    path: '$..*',
+    json: value,
+    resultType: 'all',
+  }) as JsonPathMatch[];
+
+  for (const match of matches) {
+    const v = match.value;
+    if (v === null || v === undefined) continue;
+
+    if (typeof match.parentProperty !== 'string') continue;
+    if (!(typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')) continue;
+
+    const keyName = match.parentProperty;
+    const parentPath = parentPathFromPointer(match.pointer);
+    const decisionKey = makeScopedFieldKey(methodName, direction, parentPath, keyName);
+
+    let entry = registry.get(decisionKey);
+    if (!entry) {
+      entry = {
+        methodName,
+        direction,
+        parentPath,
+        keyName,
+        values: new Set(),
+        counts: new Map(),
+      };
+      registry.set(decisionKey, entry);
     }
-    return;
+
+    entry.values.add(v);
+    entry.counts.set(v, (entry.counts.get(v) ?? 0) + 1);
   }
+}
 
-  if (typeof value === 'object') {
-    const obj = value as Record<string, unknown>;
-    for (const [key, val] of Object.entries(obj)) {
-      if (val === null || val === undefined) continue;
+function parentPathFromPointer(pointer?: string): string {
+  if (!pointer || pointer === '') return '$';
 
-      if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
-        let entry = registry.get(key);
-        if (!entry) {
-          entry = { values: new Set(), counts: new Map() };
-          registry.set(key, entry);
-        }
-        entry.values.add(val);
-        entry.counts.set(val, (entry.counts.get(val) ?? 0) + 1);
+  const segments = pointer
+    .split('/')
+    .slice(1)
+    .map((part) => part.replace(/~1/g, '/').replace(/~0/g, '~'));
+
+  if (segments.length <= 1) return '$';
+
+  const parentSegments = segments.slice(0, -1);
+  const out: string[] = [];
+
+  for (const segment of parentSegments) {
+    if (/^\d+$/.test(segment)) {
+      if (out.length === 0) {
+        out.push('[]');
       } else {
-        collectLeafValues(val, registry);
+        out[out.length - 1] = `${out[out.length - 1]}[]`;
       }
+    } else {
+      out.push(segment);
     }
-    return;
   }
+
+  if (out.length === 0) return '$';
+  return out.join('.');
 }
 
 // ── Suspect detection ───────────────────────────────────────────────
 
 export interface Suspect {
+  decisionKey: string;
+  methodName: string;
+  direction: ScopeDirection;
+  parentPath: string;
   keyName: string;
   entry: ValueEntry;
 }
 
 /**
  * Returns fields where at least one value appears more than once.
- * Sorted by key name for deterministic ordering.
+ * Sorted by method, request/response direction, parent path, then key name.
  */
 export function detectSuspects(registry: ValueRegistry): Suspect[] {
   const suspects: Suspect[] = [];
 
-  for (const [keyName, entry] of registry) {
+  for (const [decisionKey, entry] of registry) {
+    if (EXCLUDED_SUSPECT_KEYS.has(entry.keyName)) continue;
+
     let hasRepeat = false;
     for (const count of entry.counts.values()) {
       if (count > 1) {
@@ -75,12 +132,25 @@ export function detectSuspects(registry: ValueRegistry): Suspect[] {
         break;
       }
     }
-    if (hasRepeat) {
-      suspects.push({ keyName, entry });
-    }
+
+    if (!hasRepeat) continue;
+
+    suspects.push({
+      decisionKey,
+      methodName: entry.methodName,
+      direction: entry.direction,
+      parentPath: entry.parentPath,
+      keyName: entry.keyName,
+      entry,
+    });
   }
 
-  return suspects.sort((a, b) => a.keyName.localeCompare(b.keyName));
+  return suspects.sort((a, b) => (
+    a.methodName.localeCompare(b.methodName) ||
+    a.direction.localeCompare(b.direction) ||
+    a.parentPath.localeCompare(b.parentPath) ||
+    a.keyName.localeCompare(b.keyName)
+  ));
 }
 
 // ── Overlap detection ───────────────────────────────────────────────

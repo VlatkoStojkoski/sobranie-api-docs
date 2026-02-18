@@ -64,16 +64,28 @@ export interface JsonSchema {
 // ── Value Registry ──────────────────────────────────────────────────
 
 export interface ValueEntry {
+  methodName: string;
+  direction: ScopeDirection;
+  parentPath: string;
+  keyName: string;
   values: Set<string | number | boolean>;
   counts: Map<string | number | boolean, number>;
 }
 
-/** keyName → aggregated values across all methods */
+/** decisionKey (method::request|response::parentPath::field) -> aggregated values within that scope */
 export type ValueRegistry = Map<string, ValueEntry>;
+
+export type ScopeDirection = 'request' | 'response';
 
 // ── Decisions ───────────────────────────────────────────────────────
 
-export type FieldKind = 'enum' | 'fk' | 'scalar';
+export type FieldKind =
+  | 'enum'
+  | 'fk'
+  | 'foreign_value'
+  | 'index_source'
+  | 'value_source'
+  | 'scalar';
 
 export interface FieldDecision {
   kind: FieldKind;
@@ -84,7 +96,7 @@ export interface FieldDecision {
 }
 
 export interface Decisions {
-  /** keyName → decision */
+  /** decisionKey → decision (scoped key preferred: method::request|response::parentPath::fieldName) */
   fields: Record<string, FieldDecision>;
 }
 
@@ -107,6 +119,8 @@ export interface SessionProgress {
   nextPromptIndex?: number;
   /** Validation failures from last run */
   validationFailures?: ValidationFailureRecord[];
+  /** Relationship warnings from the last run */
+  relationshipWarnings?: string[];
   /** Stack of decision keys for undo */
   undoStack: string[];
 }
@@ -120,9 +134,11 @@ export interface ValidationFailureRecord {
 // ── Shared component registry (enums + FKs) ────────────────────────
 
 export interface SharedComponent {
-  kind: 'enum' | 'fk';
-  /** The base type (string, integer, number) */
+  kind: 'enum' | 'fk' | 'foreign_value';
+  /** The base type (string, integer, number, boolean, mixed) */
   baseType: string;
+  /** Optional explicit base types (used when baseType is mixed) */
+  baseTypes?: string[];
   /** For enums: the closed set of values; for FKs: empty */
   values: (string | number | boolean)[];
   /** Description for the component */
