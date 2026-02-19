@@ -22,6 +22,7 @@ import {
   samplesDir,
   decisionsPath,
   suggestionsPath,
+  llmUsagePath,
   promptLogPath,
   llmLogPath,
   pipelineLogPath,
@@ -64,6 +65,7 @@ import {
 import {
   loadSuggestionsState,
   saveSuggestionsState,
+  saveSessionUsageSnapshot,
   applyUsageToMetrics,
 } from '../llm/state.js';
 import { createSuggestionClient } from '../llm/suggest.js';
@@ -74,6 +76,7 @@ import type {
   MethodSchema,
   Decisions,
   FieldDecision,
+  FieldKind,
   SharedComponents,
 } from '../types.js';
 import type { Suspect } from '../value-registry.js';
@@ -112,18 +115,20 @@ interface PipelineCommandOptions {
   suggestionsOutputUsdPer1M?: number;
 }
 
-function resolveDecisionComponentId(decision: FieldDecision | undefined): string | undefined {
-  if (!decision) return undefined;
-  return decision.matchesExisting ?? decision.componentId;
+function decisionFieldIds(decision: FieldDecision | undefined): string[] {
+  if (!decision) return [];
+  const out: string[] = [];
+  if (decision.sourceFieldId) out.push(decision.sourceFieldId);
+  if (decision.referenceFieldId) out.push(decision.referenceFieldId);
+  return out;
 }
 
 function isComponentStillReferenced(
   decisions: Decisions,
   componentId: string,
 ): boolean {
-  return Object.values(decisions.fields).some(
-    (decision) => resolveDecisionComponentId(decision) === componentId,
-  );
+  return Object.values(decisions.fields)
+    .some((decision) => decisionFieldIds(decision).includes(componentId));
 }
 
 function removeLastOccurrence(values: string[], target: string): void {
@@ -140,8 +145,41 @@ interface SuggestionFetchResult {
   error?: string;
 }
 
-function suggestionTarget(advice: SuggestionAdvice): string | undefined {
-  return advice.reuseComponentId ?? advice.targetFieldId ?? advice.newComponentName;
+const SUGGESTION_PREFETCH_AHEAD = 2;
+
+function compareSuspectsForPrompting(a: Suspect, b: Suspect): number {
+  return (
+    a.methodName.localeCompare(b.methodName)
+    || a.direction.localeCompare(b.direction)
+    || a.parentPath.localeCompare(b.parentPath)
+    || a.keyName.localeCompare(b.keyName)
+    || a.decisionKey.localeCompare(b.decisionKey)
+  );
+}
+
+function sortSuspectsForPrompting(suspects: Suspect[]): Suspect[] {
+  return [...suspects].sort(compareSuspectsForPrompting);
+}
+
+function responseSuspectsOnly(suspects: Suspect[]): Suspect[] {
+  return suspects.filter((suspect) => suspect.direction === 'response');
+}
+
+function suggestedKind(advice: SuggestionAdvice | undefined): FieldKind | undefined {
+  if (!advice) return undefined;
+  const hasSource = advice.source.recommended === 'yes';
+  const hasReference = advice.reference.recommended === 'yes';
+  if (hasSource && hasReference) return 'source_reference';
+  if (hasSource) return 'source';
+  if (hasReference) return 'reference';
+  return 'scalar';
+}
+
+function suggestionTarget(advice: SuggestionAdvice | undefined): string | undefined {
+  if (!advice) return undefined;
+  if (advice.source.recommended === 'yes') return advice.source.yesPayload.fieldId;
+  if (advice.reference.recommended === 'yes') return advice.reference.yesPayload.fieldId;
+  return undefined;
 }
 
 function parseModelFieldId(value: string | undefined): { modelName: string; fieldName: string } | null {
@@ -196,48 +234,18 @@ function hasTypeConflict(
   return false;
 }
 
-function expectedComponentKindForDecision(
-  decisionKind: FieldDecision['kind'],
-): 'enum' | 'fk' | 'foreign_value' | null {
-  if (decisionKind === 'enum_id' || decisionKind === 'enum_value') return 'enum';
-  if (decisionKind === 'fk' || decisionKind === 'index_source') return 'fk';
-  if (decisionKind === 'foreign_value' || decisionKind === 'value_source') return 'foreign_value';
-  return null;
-}
-
-function ensureEnumDefinition(decisions: Decisions, enumName: string): {
-  ids: number[];
-  values: (string | number | boolean)[];
-  members?: Array<{ id: number; value: string | number | boolean }>;
-  description?: string;
-} {
-  const existing = decisions.enums[enumName];
-  if (existing) return existing;
-  const created = { ids: [], values: [] } as {
-    ids: number[];
-    values: (string | number | boolean)[];
-    members?: Array<{ id: number; value: string | number | boolean }>;
-    description?: string;
-  };
-  decisions.enums[enumName] = created;
-  return created;
-}
-
-function observedEnumIds(values: Set<string | number | boolean>): { ids: number[]; invalid: unknown[] } {
-  const ids: number[] = [];
-  const invalid: unknown[] = [];
-  for (const value of values) {
-    if (typeof value === 'number' && Number.isInteger(value)) {
-      ids.push(value);
-    } else {
-      invalid.push(value);
-    }
-  }
-  return { ids: Array.from(new Set(ids)).sort((a, b) => a - b), invalid };
-}
-
-function observedEnumValues(values: Set<string | number | boolean>): (string | number | boolean)[] {
-  return Array.from(new Set(values));
+function kindFromPromptResult(result: {
+  kind?: FieldKind;
+  sourceFieldId?: string;
+  referenceFieldId?: string;
+}): FieldKind {
+  if (result.kind) return result.kind;
+  const hasSource = !!result.sourceFieldId;
+  const hasReference = !!result.referenceFieldId;
+  if (hasSource && hasReference) return 'source_reference';
+  if (hasSource) return 'source';
+  if (hasReference) return 'reference';
+  return 'scalar';
 }
 
 function stableStringify(value: unknown): string {
@@ -258,7 +266,6 @@ function decisionsFingerprint(
 ): string {
   return stableStringify({
     fields: decisions.fields,
-    enums: decisions.enums,
     components,
   });
 }
@@ -277,7 +284,7 @@ async function runSession(
   },
 ): Promise<void> {
   let progress = await loadProgress(sessionDir);
-  let decisions: Decisions = { fields: {}, enums: {} };
+  let decisions: Decisions = { fields: {} };
   let components: SharedComponents = {};
   let decisionsLoaded = false;
   const pipelineLog = pipelineLogPath(sessionDir);
@@ -383,8 +390,8 @@ async function runSession(
   let suspects: Suspect[] = [];
   if (progress.step === 'collecting_values') {
     const registry = buildValueRegistry(corpora);
-    suspects = detectSuspects(registry);
-    console.log(`\n  ${suspects.length} suspect fields detected\n`);
+    suspects = sortSuspectsForPrompting(responseSuspectsOnly(detectSuspects(registry)));
+    console.log(`\n  ${suspects.length} response-side suspect fields detected\n`);
     await logPipeline('step.collect_values.done', { suspects: suspects.length });
     progress = await updateStep(sessionDir, 'prompting');
     await logPipeline('step.transition', { nextStep: progress.step });
@@ -401,11 +408,13 @@ async function runSession(
   if (progress.step === 'prompting') {
     if (suspects.length === 0) {
       const registry = buildValueRegistry(corpora);
-      suspects = detectSuspects(registry);
+      suspects = sortSuspectsForPrompting(responseSuspectsOnly(detectSuspects(registry)));
     }
 
     const startIndex = progress.nextPromptIndex ?? 0;
-    const undecided = suspects.filter((s) => !(s.decisionKey in decisions.fields));
+    const undecided = sortSuspectsForPrompting(
+      suspects.filter((s) => !(s.decisionKey in decisions.fields)),
+    );
 
     if (undecided.length > 0) {
       const mode = options.reviewMode ?? await promptBatchOrInteractive();
@@ -417,6 +426,7 @@ async function runSession(
         let suggestionClient: ReturnType<typeof createSuggestionClient> | null = null;
         const pendingSuggestions = new Map<string, Promise<SuggestionFetchResult>>();
         const suggestionFilePath = suggestionsPath(sessionDir);
+        const usageFilePath = llmUsagePath(sessionDir);
         const suggestionPricing = {
           inputUsdPer1M: options.suggestionsInputUsdPer1M,
           outputUsdPer1M: options.suggestionsOutputUsdPer1M,
@@ -439,7 +449,7 @@ async function runSession(
             console.log(`  LLM suggestions unavailable (${ready.reason}). Continuing manual mode.\n`);
           } else {
             console.log(
-              `  LLM suggestions enabled (${options.suggestionsProvider}:${options.suggestionsModel}, threshold ${options.suggestionsConfidenceThreshold.toFixed(2)})\n`,
+              `  LLM suggestions enabled (${options.suggestionsProvider}:${options.suggestionsModel})\n`,
             );
           }
         }
@@ -447,6 +457,7 @@ async function runSession(
         const persistSuggestionState = async (): Promise<void> => {
           if (!suggestionState) return;
           await saveSuggestionsState(suggestionFilePath, suggestionState);
+          await saveSessionUsageSnapshot(usageFilePath, suggestionState, suggestionPricing);
         };
 
         const fetchSuggestion = async (suspect: Suspect): Promise<SuggestionFetchResult> => {
@@ -455,10 +466,10 @@ async function runSession(
           if (cached) {
             suggestionState.metrics.cacheHits++;
             await persistSuggestionState();
+            const cachedKind = suggestedKind(cached.advice);
             await logLlm('suggestion.cache_hit', {
               decisionKey: suspect.decisionKey,
-              kind: cached.advice.kind,
-              confidence: cached.advice.confidence,
+              kind: cachedKind,
             });
             return { advice: cached.advice };
           }
@@ -466,19 +477,21 @@ async function runSession(
           const pending = pendingSuggestions.get(suspect.decisionKey);
           if (pending) return pending;
 
-          suggestionState.metrics.attemptedCalls++;
-          await logLlm('suggestion.request', {
-            decisionKey: suspect.decisionKey,
-            methodName: suspect.methodName,
-            direction: suspect.direction,
-            parentPath: suspect.parentPath,
-            keyName: suspect.keyName,
-          });
+          // Reserve the key immediately so concurrent callers share one in-flight request.
           const promise = (async (): Promise<SuggestionFetchResult> => {
+            suggestionState!.metrics.attemptedCalls++;
+            await logLlm('suggestion.request', {
+              decisionKey: suspect.decisionKey,
+              methodName: suspect.methodName,
+              direction: suspect.direction,
+              parentPath: suspect.parentPath,
+              keyName: suspect.keyName,
+            });
             const result = await suggestionClient!.suggest({
               suspect,
               components,
               decisions,
+              suspects,
             });
 
             if (result.advice) {
@@ -532,11 +545,23 @@ async function runSession(
           void fetchSuggestion(suspect);
         };
 
+        const prefetchUpcomingSuggestions = (
+          undecidedList: Suspect[],
+          currentIndex: number,
+        ): void => {
+          for (let offset = 1; offset <= SUGGESTION_PREFETCH_AHEAD; offset++) {
+            prefetchSuggestion(undecidedList[currentIndex + offset]);
+          }
+        };
+
         let i = startIndex;
         let decisionsFileHash = decisionsFingerprint(decisions, components);
         {
-          const initialUndecided = suspects.filter((s) => !(s.decisionKey in decisions.fields));
+          const initialUndecided = sortSuspectsForPrompting(
+            suspects.filter((s) => !(s.decisionKey in decisions.fields)),
+          );
           prefetchSuggestion(initialUndecided[i]);
+          prefetchUpcomingSuggestions(initialUndecided, i);
         }
         while (true) {
           const latestFile = await loadDecisions(decisionsPath(sessionDir));
@@ -553,26 +578,25 @@ async function runSession(
             });
           }
 
-          const undecidedNow = suspects.filter((s) => !(s.decisionKey in decisions.fields));
+          const undecidedNow = sortSuspectsForPrompting(
+            suspects.filter((s) => !(s.decisionKey in decisions.fields)),
+          );
           if (i >= undecidedNow.length) break;
           const suspect = undecidedNow[i]!;
           const fetchedSuggestion = await fetchSuggestion(suspect);
-          const shownSuggestion = fetchedSuggestion.advice &&
-            fetchedSuggestion.advice.confidence >= options.suggestionsConfidenceThreshold
-            ? fetchedSuggestion.advice
-            : undefined;
+          const shownSuggestion = fetchedSuggestion.advice;
+          const suggestedKindForField = suggestedKind(shownSuggestion);
           if (shownSuggestion && suggestionState) {
             suggestionState.metrics.suggestionsShown++;
             await persistSuggestionState();
           }
 
-          prefetchSuggestion(undecidedNow[i + 1]);
+          prefetchUpcomingSuggestions(undecidedNow, i);
 
           const promptStartedAt = Date.now();
           const result = await promptForSuspect(
             suspect,
             components,
-            decisions.enums,
             i,
             undecided.length,
             shownSuggestion,
@@ -584,17 +608,20 @@ async function runSession(
             suggestionState.metrics.decisionTimeMsTotal += decisionDurationMs;
             if (shownSuggestion) {
               suggestionState.metrics.decisionsWithSuggestion++;
-              if (result.kind === shownSuggestion.kind) {
+              const selectedKind = kindFromPromptResult(result);
+              if (selectedKind === suggestedKindForField) {
                 suggestionState.metrics.acceptedKind++;
               }
-              const selectedTarget = result.matchesExisting ?? result.componentId;
-              const suggestedTargetId = suggestionTarget(shownSuggestion);
+              const suggestedSource = shownSuggestion.source.recommended === 'yes'
+                ? shownSuggestion.source.yesPayload.fieldId
+                : undefined;
+              const suggestedReference = shownSuggestion.reference.recommended === 'yes'
+                ? shownSuggestion.reference.yesPayload.fieldId
+                : undefined;
               if (
-                result.kind === shownSuggestion.kind &&
-                (
-                  (selectedTarget === undefined && suggestedTargetId === undefined)
-                  || selectedTarget === suggestedTargetId
-                )
+                selectedKind === suggestedKindForField
+                && result.sourceFieldId === suggestedSource
+                && result.referenceFieldId === suggestedReference
               ) {
                 suggestionState.metrics.acceptedExact++;
               }
@@ -603,174 +630,76 @@ async function runSession(
           }
 
           if (result.action === 'back') {
-            if (i === 0) {
-              console.log('  Already at the first field. Nothing to undo.\n');
+            const previousKey = progress.undoStack[progress.undoStack.length - 1];
+            if (!previousKey) {
+              console.log('  Nothing to undo.\n');
               continue;
             }
 
-            const previousIndex = i - 1;
-            const previousSuspect = undecidedNow[previousIndex]!;
-            const previousKey = previousSuspect.decisionKey;
             const previousDecision = decisions.fields[previousKey];
-
             if (!previousDecision) {
-              console.log(`  No saved decision found for previous field (${previousSuspect.keyName}).\n`);
-              i = previousIndex;
+              // Stale undo entry (e.g. manual edits on disk). Drop it and continue.
+              removeLastOccurrence(progress.undoStack, previousKey);
+              await saveProgress(sessionDir, progress);
+              console.log('  Previous undo entry no longer exists in decisions; skipped.\n');
               continue;
             }
 
-            const componentId = resolveDecisionComponentId(previousDecision);
+            const componentIds = decisionFieldIds(previousDecision);
             removeFieldDecision(decisions, previousKey);
 
-            if (
-              componentId &&
-              previousDecision.componentId &&
-              !previousDecision.matchesExisting &&
-              !isComponentStillReferenced(decisions, componentId)
-            ) {
-              removeComponent(components, componentId);
+            for (const componentId of componentIds) {
+              if (!isComponentStillReferenced(decisions, componentId)) {
+                removeComponent(components, componentId);
+              }
             }
 
             removeLastOccurrence(progress.undoStack, previousKey);
-            progress.nextPromptIndex = previousIndex;
-            await saveProgress(sessionDir, progress);
             await saveDecisions(decisionsPath(sessionDir), decisions, components);
             decisionsFileHash = decisionsFingerprint(decisions, components);
+
+            const undecidedAfterUndo = sortSuspectsForPrompting(
+              suspects.filter((s) => !(s.decisionKey in decisions.fields)),
+            );
+            const restartIndex = undecidedAfterUndo.findIndex((s) => s.decisionKey === previousKey);
+            i = restartIndex >= 0 ? restartIndex : Math.max(0, i - 1);
+            progress.nextPromptIndex = i;
+            await saveProgress(sessionDir, progress);
+
             await logPipeline('decision.undo', {
               decisionKey: previousKey,
-              promptIndex: previousIndex,
+              promptIndex: i,
             });
 
+            const currentSuspect = undecidedAfterUndo[i];
             console.log(
-              `  Undid previous decision. Returning to ${previousSuspect.methodName} [${previousSuspect.direction}] ${previousSuspect.keyName}.\n`,
+              currentSuspect
+                ? `  Undid previous decision. Returning to ${currentSuspect.methodName} [${currentSuspect.direction}] ${currentSuspect.keyName}.\n`
+                : '  Undid previous decision.\n',
             );
-
-            i = previousIndex;
             continue;
           }
 
-          const selectedFieldId = result.matchesExisting ?? result.componentId;
-          const isEnumKind = result.kind === 'enum_id' || result.kind === 'enum_value';
-          const modelRef = isEnumKind ? null : parseModelFieldId(selectedFieldId);
-          if (result.kind !== 'scalar' && !isEnumKind && !modelRef) {
-            console.log('  Selected relationship target is not in "Model.Field" format. Restarting this field.\n');
+          const selectedKind = kindFromPromptResult(result);
+          const sourceRef = parseModelFieldId(result.sourceFieldId);
+          const referenceRef = parseModelFieldId(result.referenceFieldId);
+
+          if (result.sourceFieldId && !sourceRef) {
+            console.log('  Source field target must be in "Model.Field" format. Restarting this field.\n');
+            continue;
+          }
+          if (result.referenceFieldId && !referenceRef) {
+            console.log('  Reference target must be in "Model.Field" format. Restarting this field.\n');
             continue;
           }
 
-          if (result.kind === 'enum_id') {
-            const { ids, invalid } = observedEnumIds(suspect.entry.values);
-            if (invalid.length > 0) {
-              console.error(
-                `\nEnum ID fields must be integers. Found non-integer values: ${invalid.slice(0, 10).map(String).join(', ')}`
-                + `${invalid.length > 10 ? ` ... (+${invalid.length - 10} more)` : ''}.`,
-              );
-              const ready = await promptContinue('Edit decisions.json if needed, then restart this prompt?');
-              if (!ready) {
-                console.log('  Session saved. Resume later to continue.\n');
-                await logPipeline('session.pause', { reason: 'enum_id_non_integer' });
-                stopPromptTracing();
-                setPromptReloadHandler(null);
-                return;
-              }
-              continue;
-            }
-            if (result.enumName) {
-              const def = ensureEnumDefinition(decisions, result.enumName);
-              const existing = new Set(def.ids);
-              const drift = ids.filter((id) => !existing.has(id));
-              if (drift.length > 0 && def.ids.length > 0) {
-                console.warn(
-                  `\nEnum id drift detected for ${result.enumName}: ${drift.slice(0, 10).join(', ')}`
-                  + `${drift.length > 10 ? ` ... (+${drift.length - 10} more)` : ''}.`,
-                );
-                const shouldMerge = await promptContinue('Merge these enum ids?');
-                if (!shouldMerge) {
-                  const ready = await promptContinue('Edit decisions.json to resolve enum id drift, then continue?');
-                  if (!ready) {
-                    console.log('  Session saved. Resume later to continue.\n');
-                    await logPipeline('session.pause', { reason: 'enum_id_drift_unresolved' });
-                    stopPromptTracing();
-                    setPromptReloadHandler(null);
-                    return;
-                  }
-                  const reloaded = await loadDecisions(decisionsPath(sessionDir));
-                  decisions = reloaded.decisions;
-                  components = reloaded.components;
-                  decisionsFileHash = decisionsFingerprint(decisions, components);
-                  continue;
-                }
-              }
-              def.ids = Array.from(new Set([...def.ids, ...ids])).sort((a, b) => a - b);
-              if (selectedFieldId && components[selectedFieldId]?.kind === 'enum') {
-                components[selectedFieldId]!.values = Array.from(
-                  new Set([...(components[selectedFieldId]!.values as number[]), ...ids]),
-                ).sort((a, b) => Number(a) - Number(b));
-              }
-            }
-          }
-
-          if (result.kind === 'enum_value' && result.enumName) {
-            const observed = observedEnumValues(suspect.entry.values);
-            const def = ensureEnumDefinition(decisions, result.enumName);
-            const existing = new Set(def.values);
-            const drift = observed.filter((value) => !existing.has(value));
-            if (drift.length > 0 && def.values.length > 0) {
-              console.warn(
-                `\nEnum value drift detected for ${result.enumName}: ${drift.slice(0, 10).map(String).join(', ')}`
-                + `${drift.length > 10 ? ` ... (+${drift.length - 10} more)` : ''}.`,
-              );
-              const shouldMerge = await promptContinue('Merge these enum values?');
-              if (!shouldMerge) {
-                const ready = await promptContinue('Edit decisions.json to resolve enum value drift, then continue?');
-                if (!ready) {
-                  console.log('  Session saved. Resume later to continue.\n');
-                  await logPipeline('session.pause', { reason: 'enum_value_drift_unresolved' });
-                  stopPromptTracing();
-                  setPromptReloadHandler(null);
-                  return;
-                }
-                const reloaded = await loadDecisions(decisionsPath(sessionDir));
-                decisions = reloaded.decisions;
-                components = reloaded.components;
-                decisionsFileHash = decisionsFingerprint(decisions, components);
-                continue;
-              }
-            }
-            def.values = Array.from(new Set([...def.values, ...observed]));
-            if (selectedFieldId && components[selectedFieldId]?.kind === 'enum') {
-              components[selectedFieldId]!.values = Array.from(
-                new Set([...components[selectedFieldId]!.values, ...observed]),
-              ).sort((a, b) => String(a).localeCompare(String(b)));
-            }
-          }
-
-          if (selectedFieldId) {
-            const existingComponent = components[selectedFieldId];
+          if (result.sourceFieldId) {
+            const existingComponent = components[result.sourceFieldId];
             if (existingComponent) {
-              const expectedKind = expectedComponentKindForDecision(result.kind!);
-              if (expectedKind && existingComponent.kind !== expectedKind) {
-                console.error(
-                  `\nKind conflict on ${selectedFieldId}: existing ${existingComponent.kind}, selected ${result.kind}.`,
-                );
-                const ready = await promptContinue('Edit decisions.json to resolve this kind conflict, then continue?');
-                if (!ready) {
-                  console.log('  Session saved. Resume later to continue.\n');
-                  await logPipeline('session.pause', { reason: 'kind_conflict_unresolved' });
-                  stopPromptTracing();
-                  setPromptReloadHandler(null);
-                  return;
-                }
-                const reloaded = await loadDecisions(decisionsPath(sessionDir));
-                decisions = reloaded.decisions;
-                components = reloaded.components;
-                decisionsFileHash = decisionsFingerprint(decisions, components);
-                continue;
-              }
-
               const inferredTypes = inferPrimitiveTypes(suspect.entry.values);
               if (hasTypeConflict(existingComponent, inferredTypes)) {
                 console.error(
-                  `\nType conflict on ${selectedFieldId}: existing ${componentTypes(existingComponent).join('|') || existingComponent.baseType}, `
+                  `\nType conflict on ${result.sourceFieldId}: existing ${componentTypes(existingComponent).join('|') || existingComponent.baseType}, `
                   + `current ${inferredTypes.join('|') || 'unknown'}.`,
                 );
                 const ready = await promptContinue('Edit decisions.json to resolve this type conflict, then continue?');
@@ -790,24 +719,21 @@ async function runSession(
             }
           }
 
-          if (
-            selectedFieldId
-            && (result.kind === 'fk' || result.kind === 'foreign_value')
-            && !(selectedFieldId in components)
-          ) {
+          if (result.referenceFieldId && !(result.referenceFieldId in components)) {
             console.warn(
               `  Warning: ${suspect.methodName} [${suspect.direction}] ${suspect.parentPath}.${suspect.keyName} `
-              + `references undefined model field "${selectedFieldId}".`,
+              + `references undefined model field "${result.referenceFieldId}".`,
             );
           }
 
           setFieldDecision(decisions, suspect.decisionKey, {
-            kind: result.kind!,
-            componentId: result.componentId,
-            matchesExisting: result.matchesExisting,
-            modelName: modelRef?.modelName,
-            fieldName: modelRef?.fieldName,
-            enumName: result.enumName,
+            kind: selectedKind,
+            sourceFieldId: result.sourceFieldId,
+            referenceFieldId: result.referenceFieldId,
+            modelName: sourceRef?.modelName,
+            fieldName: sourceRef?.fieldName,
+            referenceModelName: referenceRef?.modelName,
+            referenceFieldName: referenceRef?.fieldName,
           });
 
           progress.undoStack.push(suspect.decisionKey);
@@ -817,15 +743,13 @@ async function runSession(
           decisionsFileHash = decisionsFingerprint(decisions, components);
           await logPipeline('decision.apply', {
             decisionKey: suspect.decisionKey,
-            kind: result.kind,
-            componentId: result.componentId,
-            enumName: result.enumName,
-            matchesExisting: result.matchesExisting,
+            kind: selectedKind,
+            sourceFieldId: result.sourceFieldId,
+            referenceFieldId: result.referenceFieldId,
             promptIndex: i,
             suggestionUsed: !!shownSuggestion,
-            suggestedKind: shownSuggestion?.kind,
-            suggestedTarget: shownSuggestion ? suggestionTarget(shownSuggestion) : undefined,
-            suggestionConfidence: shownSuggestion?.confidence,
+            suggestedKind: suggestedKindForField,
+            suggestedTarget: suggestionTarget(shownSuggestion),
           });
           i++;
         }
@@ -869,7 +793,7 @@ async function runSession(
         await saveDecisions(decisionsPath(sessionDir), decisions, components, suspectReference);
         console.log(`\n  Decisions file: ${decisionsPath(sessionDir)}`);
         console.log('  Pre-filled with scalar defaults + _suspectValues for context.');
-        console.log('  Edit each field: choose enum_id/enum_value/fk/foreign_value/index_source/value_source and set componentId/enumName.');
+        console.log('  Edit each field: choose scalar/source/reference/source_reference and optional sourceFieldId/referenceFieldId.');
         console.log('  Then resume this session to continue.\n');
 
         const ready = options.assumeBatchEdited || await promptContinue('Have you finished editing decisions.json?');
@@ -948,15 +872,12 @@ async function runSession(
             const lastKey = progress.undoStack.pop();
             if (lastKey) {
               const dec = decisions.fields[lastKey];
-              const componentId = resolveDecisionComponentId(dec);
+              const componentIds = decisionFieldIds(dec);
               removeFieldDecision(decisions, lastKey);
-              if (
-                componentId &&
-                dec?.componentId &&
-                !dec.matchesExisting &&
-                !isComponentStillReferenced(decisions, componentId)
-              ) {
-                removeComponent(components, componentId);
+              for (const componentId of componentIds) {
+                if (!isComponentStillReferenced(decisions, componentId)) {
+                  removeComponent(components, componentId);
+                }
               }
               await saveDecisions(decisionsPath(sessionDir), decisions, components);
               await saveProgress(sessionDir, progress);
@@ -1315,7 +1236,7 @@ function addPipelineOptions<T extends import('commander').Command>(command: T): 
     )
     .option(
       '--suggestions-confidence-threshold <n>',
-      'Show suggestions only when confidence >= n (0..1)',
+      'Legacy option (ignored with rank-based suggestions)',
       parseConfidenceThreshold,
       0.6,
     )

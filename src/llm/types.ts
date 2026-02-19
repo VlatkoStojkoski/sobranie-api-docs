@@ -1,28 +1,44 @@
-import type { FieldKind } from '../types.js';
+export type SuggestionChoice = 'yes' | 'no';
+export type SuggestionBinaryRank = 1 | 2;
+
+export interface SuggestionRankedChoice {
+  choice: SuggestionChoice;
+  rank: SuggestionBinaryRank;
+  reason: string;
+}
+
+export interface SuggestionSourceStep {
+  recommended: SuggestionChoice;
+  rankedChoices: SuggestionRankedChoice[];
+  yesPayload: {
+    fieldId: string;
+    reason: string;
+  };
+  noPayload: {
+    reason: string;
+  };
+}
+
+export interface SuggestionReferenceStep {
+  recommended: SuggestionChoice;
+  rankedChoices: SuggestionRankedChoice[];
+  yesPayload: {
+    fieldId: string;
+    reason: string;
+  };
+  noPayload: {
+    reason: string;
+  };
+}
 
 export interface SuggestionAdvice {
-  kind: FieldKind;
-  confidence: number;
-  reason: string;
   /**
-   * Canonical field/component id to use when selecting fk/foreign_value/source kinds.
-   * Example: "Committee.Id"
+   * Short summary explaining how source/reference recommendations fit together.
+   * Scalar is implied when both source and reference are "no".
    */
-  targetFieldId?: string;
-  /**
-   * Existing component id to reuse (mainly for enums).
-   */
-  reuseComponentId?: string;
-  /**
-   * Suggested new component/type name when creating a new shared definition.
-   */
-  newComponentName?: string;
-  /**
-   * Companion source field id suggestion:
-   * - for fk, usually an index_source id
-   * - for foreign_value, usually a value_source id
-   */
-  sourceReferenceFieldId?: string;
+  overallReason: string;
+  source: SuggestionSourceStep;
+  reference: SuggestionReferenceStep;
 }
 
 export interface SuggestionUsage {

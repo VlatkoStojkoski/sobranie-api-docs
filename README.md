@@ -31,7 +31,7 @@ pnpm start        # Interactive: new session or resume existing
 - `--force-on-validation-failure`: emit even when validation fails (non-interactive fallback)
 - `--suggestions <on|off>`: enable advisory LLM suggestions during interactive suspect review
 - `--suggestions-model <id>`: suggestion model id (default: `gemini-2.5-flash-lite`)
-- `--suggestions-confidence-threshold <0..1>`: show only confident suggestions (default: `0.6`)
+- `--suggestions-confidence-threshold <0..1>`: legacy option, currently ignored with rank-based suggestions
 - `--suggestions-input-usd-per-1m <usd>` / `--suggestions-output-usd-per-1m <usd>`: optional pricing rates for estimated cost metrics
 - `start --action <new|resume>`: skip menu selection
 - `resume --latest`: resume newest session without prompt
@@ -69,6 +69,7 @@ sessions/2025-02-16T14-30-00-000Z/
   samples/               # Extracted request/response JSON per method
   decisions.json         # User decisions + model-field definitions (version 2)
   suggestions.json       # Cached LLM suggestions + usage/acceptance/cost metrics
+  llm-usage.json         # Rolling per-session LLM usage + estimated cost snapshot
   logs/
     prompts.jsonl        # Every interactive prompt + selected/typed response
     llm.jsonl            # LLM prompt payloads, responses, latency, token usage

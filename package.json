@@ -13,10 +13,11 @@
     "new": "tsx src/cli/index.ts new",
     "resume": "tsx src/cli/index.ts resume",
     "sessions": "tsx src/cli/index.ts sessions",
-    "test": "tsx test/test-extract.ts && tsx test/test-infer.ts && tsx test/test-value-registry.ts && tsx test/test-decisions.ts && tsx test/test-relationships.ts && tsx test/test-transform-validate.ts && tsx test/test-emit.ts && tsx test/test-session.ts && tsx test/test-e2e.ts && tsx test/test-cli.ts"
+    "test": "tsx test/test-extract.ts && tsx test/test-infer.ts && tsx test/test-value-registry.ts && tsx test/test-decisions.ts && tsx test/test-relationships.ts && tsx test/test-transform-validate.ts && tsx test/test-emit.ts && tsx test/test-session.ts && tsx test/test-e2e.ts && tsx test/test-llm-suggestions.ts && tsx test/test-cli.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",
+    "@google/genai": "^1.42.0",
     "@inquirer/prompts": "^8.2.1",
     "ai": "^6.0.91",
     "ajv": "^8.17.0",

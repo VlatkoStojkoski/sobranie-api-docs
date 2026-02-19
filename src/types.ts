@@ -80,45 +80,30 @@ export type ScopeDirection = 'request' | 'response';
 // ── Decisions ───────────────────────────────────────────────────────
 
 export type FieldKind =
-  | 'enum_id'
-  | 'enum_value'
-  | 'fk'
-  | 'foreign_value'
-  | 'index_source'
-  | 'value_source'
-  | 'scalar';
+  | 'scalar'
+  | 'source'
+  | 'reference'
+  | 'source_reference';
 
 export interface FieldDecision {
   kind: FieldKind;
-  /** Canonical model field id, e.g. "Committee.Id" */
-  componentId?: string;
-  /** References an existing component by ID when user says "same as X" */
-  matchesExisting?: string;
-  /** Structured model reference (non-scalar kinds) */
+  /** Canonical model field id where this field is modeled, e.g. "Material.Title" */
+  sourceFieldId?: string;
+  /** Canonical target model field this field references, e.g. "Structure.Id" */
+  referenceFieldId?: string;
+  /** Structured source model reference (optional convenience metadata) */
   modelName?: string;
-  /** Structured field reference (non-scalar kinds) */
+  /** Structured source field reference (optional convenience metadata) */
   fieldName?: string;
-  /** Enum name for enum_id / enum_value decisions */
-  enumName?: string;
+  /** Structured reference model reference (optional convenience metadata) */
+  referenceModelName?: string;
+  /** Structured reference field reference (optional convenience metadata) */
+  referenceFieldName?: string;
 }
-
-export interface EnumDefinition {
-  /** Unique observed integer ids */
-  ids: number[];
-  /** Unique observed display values */
-  values: (string | number | boolean)[];
-  /** Optional explicit mapping table (editable in decisions.json) */
-  members?: Array<{ id: number; value: string | number | boolean }>;
-  description?: string;
-}
-
-export type EnumRegistry = Record<string, EnumDefinition>;
 
 export interface Decisions {
   /** decisionKey → decision (scoped key preferred: method::request|response::parentPath::fieldName) */
   fields: Record<string, FieldDecision>;
-  /** enumName -> enum definition */
-  enums: EnumRegistry;
 }
 
 // ── Session ─────────────────────────────────────────────────────────
@@ -152,15 +137,15 @@ export interface ValidationFailureRecord {
   responseErrors: string[];
 }
 
-// ── Shared component registry (enums + FKs) ────────────────────────
+// ── Shared model field registry ─────────────────────────────────────
 
 export interface SharedComponent {
-  kind: 'enum' | 'fk' | 'foreign_value';
+  kind: 'field';
   /** The base type (string, integer, number, boolean, mixed) */
   baseType: string;
   /** Optional explicit base types (used when baseType is mixed) */
   baseTypes?: string[];
-  /** For enums: the closed set of values; for FKs: empty */
+  /** Observed values for this modeled field (optional signal for overlap/type inference) */
   values: (string | number | boolean)[];
   /** Description for the component */
   description?: string;

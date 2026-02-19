@@ -2,8 +2,10 @@
  * Schema Transform: apply user decisions to quicktype-inferred schemas.
  *
  * For each property in each method schema, apply scoped user decisions:
- * - enum_id/enum_value/fk/foreign_value => reference shared component + metadata
- * - index_source/value_source => keep inline schema + source metadata
+ * - scalar => keep inline schema as inferred.
+ * - source => annotate field as modeled source field (Model.Field).
+ * - reference => annotate field as relationship reference (Model.Field).
+ * - source_reference => annotate both roles.
  */
 
 import type {
@@ -17,11 +19,6 @@ import { decisionLookupKeys } from './scoped-field.js';
 
 // ── Transform schemas using decisions ───────────────────────────────
 
-/**
- * Walk all method schemas and replace properties matching a decision
- * with $ref to the corresponding shared component.
- * Returns new schema objects (does not mutate originals).
- */
 export function transformSchemas(
   schemas: MethodSchema[],
   decisions: Decisions,
@@ -67,110 +64,38 @@ function transformSchema(
         const decision = decisionLookupKeys(methodName, direction, parentPath, propName)
           .map((decisionKey) => decisions.fields[decisionKey])
           .find(Boolean);
-        if (decision) {
-          const fieldId = decision.matchesExisting ?? decision.componentId;
-          if (
-            fieldId &&
-            (decision.kind === 'index_source' || decision.kind === 'value_source')
-          ) {
-            const transformed = transformSchema(
-              propSchema,
-              decisions,
-              components,
-              methodName,
-              direction,
-              appendObjectPath(parentPath, propName),
-            );
-            result.properties[propName] = addSourceMetadata(transformed, fieldId);
-            continue;
-          }
 
-          if (
-            fieldId &&
-            (
-              decision.kind === 'enum_id'
-              || decision.kind === 'enum_value'
-              || decision.kind === 'fk'
-              || decision.kind === 'foreign_value'
-            ) &&
-            fieldId in components
-          ) {
-            const ref: JsonSchema = { $ref: `#/components/schemas/${fieldId}` };
-
-            // Preserve nullable from the original schema
-            const isNullable = propSchema.nullable === true ||
-              (propSchema.anyOf?.some((s) => s.type === 'null')) ||
-              false;
-
-            if (isNullable) {
-              result.properties[propName] = {
-                anyOf: [ref, { type: 'null' as const }],
-                nullable: true,
-                ...(decision.kind === 'enum_id' || decision.kind === 'enum_value'
-                  ? {
-                    'x-enum': {
-                      role: decision.kind,
-                      name: decision.enumName ?? fieldId,
-                    },
-                  }
-                  : {
-                    'x-relationship': {
-                      role: decision.kind,
-                      field: fieldId,
-                    },
-                  }),
-              };
-            } else {
-              result.properties[propName] = {
-                ...ref,
-                ...(decision.kind === 'enum_id' || decision.kind === 'enum_value'
-                  ? {
-                    'x-enum': {
-                      role: decision.kind,
-                      name: decision.enumName ?? fieldId,
-                    },
-                  }
-                  : {
-                    'x-relationship': {
-                      role: decision.kind,
-                      field: fieldId,
-                    },
-                  }),
-              };
-            }
-            continue;
-          }
-
-          if (
-            fieldId &&
-            (decision.kind === 'fk' || decision.kind === 'foreign_value')
-          ) {
-            const transformed = transformSchema(
-              propSchema,
-              decisions,
-              components,
-              methodName,
-              direction,
-              appendObjectPath(parentPath, propName),
-            );
-            result.properties[propName] = {
-              ...transformed,
-              'x-relationship': {
-                role: decision.kind,
-                field: fieldId,
-              },
-            };
-            continue;
-          }
+        if (!decision || decision.kind === 'scalar') {
+          result.properties[propName] = transformSchema(
+            propSchema,
+            decisions,
+            components,
+            methodName,
+            direction,
+            appendObjectPath(parentPath, propName),
+          );
+          continue;
         }
-        // Recurse into non-decided properties
-        result.properties[propName] = transformSchema(
+
+        const transformed = transformSchema(
           propSchema,
           decisions,
           components,
           methodName,
           direction,
           appendObjectPath(parentPath, propName),
+        );
+
+        const sourceFieldId = decision.sourceFieldId;
+        const referenceFieldId = decision.referenceFieldId;
+        const sourceRef = sourceFieldId && (sourceFieldId in components)
+          ? buildRefSchema(propSchema, sourceFieldId)
+          : transformed;
+
+        result.properties[propName] = withRoleMetadata(
+          sourceRef,
+          sourceFieldId,
+          referenceFieldId,
         );
       }
       continue;
@@ -209,8 +134,8 @@ function transformSchema(
 
     if (key === 'definitions' && typeof value === 'object' && value !== null) {
       const defs: Record<string, JsonSchema> = {};
-      for (const [k, v] of Object.entries(value as Record<string, JsonSchema>)) {
-        defs[k] = transformSchema(v, decisions, components, methodName, direction, parentPath);
+      for (const [defKey, defValue] of Object.entries(value as Record<string, JsonSchema>)) {
+        defs[defKey] = transformSchema(defValue, decisions, components, methodName, direction, parentPath);
       }
       result.definitions = defs;
       continue;
@@ -220,6 +145,45 @@ function transformSchema(
   }
 
   return result;
+}
+
+function buildRefSchema(original: JsonSchema, fieldId: string): JsonSchema {
+  const ref: JsonSchema = { $ref: `#/components/schemas/${fieldId}` };
+  const isNullable = original.nullable === true
+    || (original.anyOf?.some((s) => s.type === 'null') ?? false);
+
+  if (!isNullable) return ref;
+
+  return {
+    anyOf: [ref, { type: 'null' as const }],
+    nullable: true,
+  };
+}
+
+function withRoleMetadata(
+  schema: JsonSchema,
+  sourceFieldId: string | undefined,
+  referenceFieldId: string | undefined,
+): JsonSchema {
+  return {
+    ...schema,
+    ...(sourceFieldId
+      ? {
+        'x-model-source': {
+          role: 'source',
+          field: sourceFieldId,
+        },
+      }
+      : {}),
+    ...(referenceFieldId
+      ? {
+        'x-relationship': {
+          role: 'reference',
+          field: referenceFieldId,
+        },
+      }
+      : {}),
+  };
 }
 
 function appendObjectPath(parentPath: string, key: string): string {
@@ -233,25 +197,8 @@ function appendArrayPath(parentPath: string): string {
   return `${parentPath}[]`;
 }
 
-function addSourceMetadata(schema: JsonSchema, fieldId: string): JsonSchema {
-  return {
-    ...schema,
-    'x-relationship': {
-      role: 'source',
-      field: fieldId,
-    },
-    'x-model-source': {
-      role: 'source',
-      field: fieldId,
-    },
-  };
-}
-
 // ── Build component schemas for OpenAPI ─────────────────────────────
 
-/**
- * Convert SharedComponents into OpenAPI-compatible JsonSchema definitions.
- */
 export function buildComponentSchemas(
   components: SharedComponents,
 ): Record<string, JsonSchema> {
@@ -259,31 +206,20 @@ export function buildComponentSchemas(
 
   for (const [id, comp] of Object.entries(components)) {
     const resolvedTypes = resolveComponentTypes(comp);
-    if (comp.kind === 'enum') {
+    if (resolvedTypes.length === 1) {
       schemas[id] = {
-        ...(resolvedTypes.length === 1 ? { type: resolvedTypes[0]! } : {}),
-        enum: comp.values,
-        description: comp.description ?? `Enum: ${id}`,
+        type: resolvedTypes[0]!,
+        description: comp.description ?? `Model field: ${id}`,
+      };
+    } else if (resolvedTypes.length > 1) {
+      schemas[id] = {
+        oneOf: resolvedTypes.map((t) => ({ type: t })),
+        description: comp.description ?? `Model field: ${id}`,
       };
     } else {
-      const fallbackDescription = comp.kind === 'foreign_value'
-        ? `Foreign value: ${id}`
-        : `Reference: ${id}`;
-      if (resolvedTypes.length === 1) {
-        schemas[id] = {
-          type: resolvedTypes[0]!,
-          description: comp.description ?? fallbackDescription,
-        };
-      } else if (resolvedTypes.length > 1) {
-        schemas[id] = {
-          oneOf: resolvedTypes.map((t) => ({ type: t })),
-          description: comp.description ?? fallbackDescription,
-        };
-      } else {
-        schemas[id] = {
-          description: comp.description ?? fallbackDescription,
-        };
-      }
+      schemas[id] = {
+        description: comp.description ?? `Model field: ${id}`,
+      };
     }
   }
 
@@ -363,9 +299,9 @@ function resolveComponentTypes(component: {
     }
   }
 
-  const out: string[] = [];
-  if (hasString) out.push('string');
-  if (hasNumber) out.push(hasInteger ? 'integer' : 'number');
-  if (hasBoolean) out.push('boolean');
-  return out;
+  const types: string[] = [];
+  if (hasString) types.push('string');
+  if (hasNumber) types.push(hasInteger ? 'integer' : 'number');
+  if (hasBoolean) types.push('boolean');
+  return types;
 }

@@ -1,26 +1,23 @@
-import { generateText, Output } from 'ai';
-import { createGoogleGenerativeAI } from '@ai-sdk/google';
-import { z } from 'zod';
-
-import type { Decisions, SharedComponents } from '../types.js';
+import type { Decisions, FieldKind, SharedComponents } from '../types.js';
 import type { Suspect } from '../value-registry.js';
 import { findOverlappingComponents } from '../decisions.js';
-import type { SuggestionAdvice, SuggestionUsage } from './types.js';
-
-const SUGGESTION_SCHEMA = z.object({
-  kind: z.enum(['scalar', 'enum_id', 'enum_value', 'fk', 'foreign_value', 'index_source', 'value_source']),
-  confidence: z.number().min(0).max(1),
-  reason: z.string().min(1).max(220),
-  targetFieldId: z.string().min(1).max(120).optional(),
-  reuseComponentId: z.string().min(1).max(120).optional(),
-  newComponentName: z.string().min(1).max(120).optional(),
-  sourceReferenceFieldId: z.string().min(1).max(120).optional(),
-});
+import { parseScopedFieldKey } from '../scoped-field.js';
+import type {
+  SuggestionAdvice,
+  SuggestionUsage,
+} from './types.js';
+import type {
+  SuggestionPromptFunction,
+  SuggestionPromptRequest,
+} from './prompt-contract.js';
+import { promptSuggestionWithGoogleGenAI } from './prompt-google-genai.js';
+import { promptSuggestionWithVercel } from './prompt-vercel.js';
 
 export interface SuggestionRequest {
   suspect: Suspect;
   components: SharedComponents;
   decisions: Decisions;
+  suspects?: Suspect[];
 }
 
 export interface SuggestionResult {
@@ -38,18 +35,31 @@ export interface SuggestionClient {
   suggest(input: SuggestionRequest): Promise<SuggestionResult>;
 }
 
+export type SuggestionPromptBackend = 'google_genai' | 'vercel';
+
 interface GoogleSuggestionClientOptions {
   model: string;
   apiKey?: string;
+  backend: SuggestionPromptBackend;
 }
+
+const PROMPT_BACKENDS: Record<SuggestionPromptBackend, SuggestionPromptFunction> = {
+  google_genai: promptSuggestionWithGoogleGenAI,
+  vercel: promptSuggestionWithVercel,
+};
 
 class GoogleSuggestionClient implements SuggestionClient {
   readonly model: string;
+  readonly backend: SuggestionPromptBackend;
+
   private readonly apiKey?: string;
+  private readonly promptSuggestion: SuggestionPromptFunction;
 
   constructor(options: GoogleSuggestionClientOptions) {
     this.model = options.model;
     this.apiKey = options.apiKey;
+    this.backend = options.backend;
+    this.promptSuggestion = PROMPT_BACKENDS[options.backend];
   }
 
   isReady(): { ok: true } | { ok: false; reason: string } {
@@ -71,33 +81,22 @@ class GoogleSuggestionClient implements SuggestionClient {
     }
 
     const startedAt = Date.now();
-    const google = createGoogleGenerativeAI({ apiKey: this.apiKey });
 
     try {
-      const result = await generateText({
-        model: google(this.model),
-        temperature: 0,
-        maxOutputTokens: 220,
-        output: Output.object({ schema: SUGGESTION_SCHEMA }),
-        system: [
-          'You are assisting a schema-discovery CLI.',
-          'Return only the structured object.',
-          'Prefer conservative suggestions and do not over-assert confidence.',
-          'Use kind=scalar when evidence is weak.',
-        ].join(' '),
+      const result = await this.promptSuggestion({
+        apiKey: this.apiKey!,
+        model: this.model,
         prompt,
-      });
-
-      const usage = usageFromResult(result.usage);
-      const advice = normalizeAdvice(result.output);
+      } satisfies SuggestionPromptRequest);
 
       return {
         prompt,
-        advice,
-        usage,
+        advice: result.advice,
+        usage: result.usage,
         latencyMs: Date.now() - startedAt,
-        rawResponse: result.output as Record<string, unknown>,
-      };
+        error: result.error,
+        rawResponse: result.rawResponse,
+      } satisfies SuggestionResult;
     } catch (error) {
       return {
         prompt,
@@ -111,6 +110,7 @@ class GoogleSuggestionClient implements SuggestionClient {
 export interface CreateSuggestionClientOptions {
   provider: 'google';
   model: string;
+  backend?: SuggestionPromptBackend;
 }
 
 export function createSuggestionClient(
@@ -122,18 +122,33 @@ export function createSuggestionClient(
       return new GoogleSuggestionClient({
         model: options.model,
         apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+        backend: resolvePromptBackend(options.backend),
       });
   }
+}
+
+function resolvePromptBackend(
+  requested?: SuggestionPromptBackend,
+): SuggestionPromptBackend {
+  if (requested) return requested;
+
+  const envValue = process.env.SUGGESTIONS_PROMPT_BACKEND?.trim().toLowerCase();
+  if (envValue === 'vercel') return 'vercel';
+  if (envValue === 'google_genai' || envValue === 'google-genai') {
+    return 'google_genai';
+  }
+
+  return 'google_genai';
 }
 
 function buildPrompt(input: SuggestionRequest): string {
   const { suspect, components, decisions } = input;
   const values = Array.from(suspect.entry.values).slice(0, 30);
-  const counts: Array<{ value: string | number | boolean; count: number }> = [];
-  for (const [value, count] of suspect.entry.counts.entries()) {
-    counts.push({ value, count });
-  }
-  counts.sort((a, b) => b.count - a.count);
+
+  const siblingFields = buildSiblingFieldSnapshot(
+    suspect,
+    input.suspects ?? [],
+  );
 
   const overlapping = findOverlappingComponents(components, values).slice(0, 10).map((m) => ({
     id: m.id,
@@ -143,41 +158,93 @@ function buildPrompt(input: SuggestionRequest): string {
     sampleValues: m.component.values.slice(0, 12),
   }));
 
-  const decisionSample = Object.entries(decisions.fields).slice(0, 120).map(([decisionKey, decision]) => ({
-    decisionKey,
-    kind: decision.kind,
-    componentId: decision.componentId,
-    matchesExisting: decision.matchesExisting,
-  }));
+  const decisionSummary = summarizeDecisionContext(decisions, suspect);
 
   const payload = {
-    task: 'Classify one suspect field for API schema discovery.',
+    task: 'Produce suggestions for a source/reference field decision flow.',
+    projectContext: {
+      objective: [
+        'Classify each API field using two independent steps:',
+        '1) whether field maps to a canonical model field (source role)',
+        '2) whether field references another model field (reference role)',
+        'If both are "no", the field is scalar by definition (no extra modeling metadata).',
+      ],
+      roleDefinitions: {
+        source: [
+          'source=yes means this API field is itself a model field on the current entity.',
+          'The source target is where this field should live in canonical schema.',
+        ],
+        reference: [
+          'reference=yes means this API field points to another model field (relationship).',
+          'Reference target should usually be a different model field than source target.',
+        ],
+      },
+      roleExamples: [
+        {
+          field: 'TypeId on committee rows',
+          source: 'yes -> Committee.TypeId',
+          reference: 'yes -> Type.Id',
+        },
+        {
+          field: 'Id on committee rows',
+          source: 'yes -> Committee.Id',
+          reference: 'no',
+        },
+        {
+          field: 'Committees count in dashboard statistics',
+          source: 'no',
+          reference: 'no',
+        },
+      ],
+      canonicalTargetFormat: 'Model.Field',
+      canonicalTargetExamples: [
+        'Material.ResponsibleCommittee',
+        'Structure.Id',
+        'Language.Id',
+      ],
+      invalidTargetExamples: [
+        'GetAllMaterialsForPublicPortal.Items[].ResponsibleCommittee',
+        'GetAllX::response::[]::Id',
+      ],
+      notes: [
+        'A field may be both source and reference.',
+        'If both are yes, source.yesPayload.fieldId and reference.yesPayload.fieldId must not be identical.',
+        'For simple entity Id fields, reference is usually no unless relation evidence is explicit.',
+        'Do not rely heavily on value-count statistics; use naming, path, and sibling semantics first.',
+        'Use concise singular model names and PascalCase-like identifiers where possible.',
+      ],
+    },
     suspect: {
       decisionKey: suspect.decisionKey,
       methodName: suspect.methodName,
       direction: suspect.direction,
       parentPath: suspect.parentPath,
       keyName: suspect.keyName,
-      uniqueCount: suspect.entry.values.size,
+      primitiveTypes: inferPrimitiveTypes(suspect.entry.values),
       valuePreview: values,
-      topCounts: counts.slice(0, 20),
     },
-    existingComponents: overlapping,
-    decisionsContext: decisionSample,
+    siblingFields,
+    existingModelFields: overlapping.map((entry) => ({
+      fieldId: entry.id,
+      baseType: entry.baseType,
+      overlapCount: entry.overlapCount,
+      sampleValues: entry.sampleValues,
+    })),
+    decisionExamples: decisionSummary,
+    namingHints: {
+      suggestedModel: suggestModelName(suspect.keyName),
+      suggestedField: suggestSimpleFieldName(suspect.keyName),
+    },
     outputRequirements: {
-      kind: ['scalar', 'enum_id', 'enum_value', 'fk', 'foreign_value', 'index_source', 'value_source'],
-      confidenceRange: '0..1',
-      reason: 'single short sentence',
-      optionalFields: [
-        'targetFieldId',
-        'reuseComponentId',
-        'newComponentName',
-        'sourceReferenceFieldId',
-      ],
+      overallReason: 'single short sentence',
       guidance: [
-        'If kind is enum_id or enum_value, set newComponentName to the enum name.',
-        'If kind is fk/foreign_value/index_source/value_source, set targetFieldId.',
-        'If kind is fk or foreign_value and companion source is likely known, set sourceReferenceFieldId.',
+        'Return source/reference sections with yes/no ranked choices and recommended choice for each.',
+        'Ranks must be 1..2 with unique ranks and include both yes and no.',
+        'Include payloads for both yes and no routes so UI can use suggestions regardless of user path.',
+        'For source.yesPayload.fieldId and reference.yesPayload.fieldId, output canonical Model.Field only.',
+        'Source and reference targets must represent different roles; do not reuse the exact same fieldId for both.',
+        'Never output method/path-based targets.',
+        'Keep each reason under 120 characters.',
       ],
     },
   };
@@ -185,37 +252,129 @@ function buildPrompt(input: SuggestionRequest): string {
   return JSON.stringify(payload, null, 2);
 }
 
-function usageFromResult(
-  usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined,
-): SuggestionUsage | undefined {
-  if (!usage) return undefined;
+function buildSiblingFieldSnapshot(
+  suspect: Suspect,
+  suspects: Suspect[],
+): Array<{
+  keyName: string;
+  uniqueCount: number;
+  primitiveTypes: string[];
+  sampleValues: Array<string | number | boolean>;
+}> {
+  return suspects
+    .filter((candidate) => (
+      candidate.methodName === suspect.methodName
+      && candidate.direction === suspect.direction
+      && candidate.parentPath === suspect.parentPath
+      && candidate.keyName !== suspect.keyName
+    ))
+    .sort((a, b) => a.keyName.localeCompare(b.keyName))
+    .slice(0, 16)
+    .map((candidate) => ({
+      keyName: candidate.keyName,
+      uniqueCount: candidate.entry.values.size,
+      primitiveTypes: inferPrimitiveTypes(candidate.entry.values),
+      sampleValues: Array.from(candidate.entry.values).slice(0, 6),
+    }));
+}
+
+function inferPrimitiveTypes(values: Set<string | number | boolean>): string[] {
+  let hasString = false;
+  let hasNumber = false;
+  let hasInteger = true;
+  let hasBoolean = false;
+  for (const value of values) {
+    if (typeof value === 'string') hasString = true;
+    if (typeof value === 'boolean') hasBoolean = true;
+    if (typeof value === 'number') {
+      hasNumber = true;
+      if (!Number.isInteger(value)) hasInteger = false;
+    }
+  }
+  const out: string[] = [];
+  if (hasString) out.push('string');
+  if (hasNumber) out.push(hasInteger ? 'integer' : 'number');
+  if (hasBoolean) out.push('boolean');
+  return out;
+}
+
+interface ParsedDecisionEntry {
+  decisionKey: string;
+  methodName: string;
+  direction: 'request' | 'response';
+  parentPath: string;
+  keyName: string;
+  kind: FieldKind;
+  sourceFieldId?: string;
+  referenceFieldId?: string;
+}
+
+function summarizeDecisionContext(
+  decisions: Decisions,
+  suspect: Suspect,
+): {
+  recentForSameKey: string[];
+  recentForSameSuffix: string[];
+} {
+  const entries = parsedDecisionEntries(decisions);
+  const sameKeyName = entries
+    .filter((entry) => entry.keyName === suspect.keyName)
+    .slice(0, 8);
+  const suffix = detectKeySuffix(suspect.keyName);
+  const suffixEntries = suffix
+    ? entries.filter((entry) => entry.keyName.endsWith(suffix)).slice(0, 8)
+    : [];
+
   return {
-    inputTokens: usage.inputTokens ?? 0,
-    outputTokens: usage.outputTokens ?? 0,
-    totalTokens: usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+    recentForSameKey: sameKeyName.map(formatDecisionExample),
+    recentForSameSuffix: suffixEntries.map(formatDecisionExample),
   };
 }
 
-function normalizeAdvice(output: z.infer<typeof SUGGESTION_SCHEMA>): SuggestionAdvice {
-  return {
-    kind: output.kind,
-    confidence: clamp01(output.confidence),
-    reason: output.reason.trim(),
-    targetFieldId: nonEmpty(output.targetFieldId),
-    reuseComponentId: nonEmpty(output.reuseComponentId),
-    newComponentName: nonEmpty(output.newComponentName),
-    sourceReferenceFieldId: nonEmpty(output.sourceReferenceFieldId),
+function parsedDecisionEntries(decisions: Decisions): ParsedDecisionEntry[] {
+  const entries: ParsedDecisionEntry[] = [];
+  for (const [decisionKey, decision] of Object.entries(decisions.fields)) {
+    const parsed = parseScopedFieldKey(decisionKey);
+    if (!parsed) continue;
+    entries.push({
+      decisionKey,
+      methodName: parsed.methodName,
+      direction: parsed.direction,
+      parentPath: parsed.parentPath,
+      keyName: parsed.keyName,
+      kind: decision.kind,
+      sourceFieldId: decision.sourceFieldId,
+      referenceFieldId: decision.referenceFieldId,
+    });
+  }
+  return entries;
+}
+
+function formatDecisionExample(entry: ParsedDecisionEntry): string {
+  const refs: string[] = [];
+  if (entry.sourceFieldId) refs.push(`source=${entry.sourceFieldId}`);
+  if (entry.referenceFieldId) refs.push(`reference=${entry.referenceFieldId}`);
+  return `${entry.methodName} [${entry.direction}] ${entry.parentPath}.${entry.keyName} => ${entry.kind}${refs.length > 0 ? ` (${refs.join(', ')})` : ''}`;
+}
+
+function detectKeySuffix(keyName: string): string | undefined {
+  const suffixes = ['TypeId', 'TypeTitle', 'Id', 'Title', 'Name', 'Code'];
+  return suffixes.find((suffix) => keyName.endsWith(suffix));
+}
+
+function suggestSimpleFieldName(keyName: string): string {
+  const bySuffix = (suffix: string): string | null => {
+    if (!keyName.endsWith(suffix) || keyName.length <= suffix.length) return null;
+    return keyName.slice(0, -suffix.length);
   };
+  return bySuffix('Id')
+    ?? bySuffix('Title')
+    ?? bySuffix('Name')
+    ?? keyName;
 }
 
-function nonEmpty(value: string | undefined): string | undefined {
-  if (!value) return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function clamp01(value: number): number {
-  if (value < 0) return 0;
-  if (value > 1) return 1;
-  return value;
+function suggestModelName(keyName: string): string {
+  const parsed = suggestSimpleFieldName(keyName);
+  if (parsed === keyName) return keyName;
+  return parsed;
 }

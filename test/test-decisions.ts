@@ -13,7 +13,6 @@ import {
   findOverlappingComponents,
   mergeIntoComponent,
   generateComponentId,
-  enumComponentId,
 } from '../src/decisions.js';
 
 async function main(): Promise<void> {
@@ -24,28 +23,30 @@ async function main(): Promise<void> {
     const { decisions, components } = createEmptyDecisions();
 
     setFieldDecision(decisions, 'Status', {
-      kind: 'enum_value',
-      enumName: 'Status',
-      componentId: enumComponentId('Status', 'value'),
+      kind: 'source',
+      sourceFieldId: 'Status.Value',
     });
-    setFieldDecision(decisions, 'CommitteeId', { kind: 'fk', componentId: 'CommitteeIdRef' });
+    setFieldDecision(decisions, 'CommitteeId', {
+      kind: 'source_reference',
+      sourceFieldId: 'Committee.Id',
+      referenceFieldId: 'Committee.Id',
+    });
     setFieldDecision(decisions, 'Title', { kind: 'scalar' });
-    decisions.enums.Status = { ids: [1, 2], values: ['active', 'closed'] };
 
-    addComponent(components, enumComponentId('Status', 'value'), {
-      kind: 'enum',
+    addComponent(components, 'Status.Value', {
+      kind: 'field',
       baseType: 'string',
       values: ['draft', 'active', 'closed'],
     });
-    addComponent(components, enumComponentId('StatusLegacy', 'value'), {
-      kind: 'enum',
+    addComponent(components, 'Status.LegacyValue', {
+      kind: 'field',
       baseType: 'string',
       values: ['active', 'paused'],
     });
-    addComponent(components, 'CommitteeIdRef', {
-      kind: 'fk',
+    addComponent(components, 'Committee.Id', {
+      kind: 'field',
       baseType: 'integer',
-      values: [],
+      values: [1, 2, 3],
     });
 
     await saveDecisions(file, decisions, components, {
@@ -53,45 +54,41 @@ async function main(): Promise<void> {
     });
 
     const raw = JSON.parse(await readFile(file, 'utf-8')) as Record<string, unknown>;
-    assert.equal(raw.version, 3, 'save should write schema version');
+    assert.equal(raw.version, 4, 'save should write schema version');
     assert.ok(raw._suspectValues, 'save should include optional suspect reference');
 
     const loaded = await loadDecisions(file);
     assert.equal(Object.keys(loaded.decisions.fields).length, 3);
-    assert.equal(Object.keys(loaded.decisions.enums).length, 1);
     assert.equal(Object.keys(loaded.components).length, 3);
 
     const overlaps = findOverlappingComponents(loaded.components, ['active', 'draft']);
     assert.deepEqual(
       overlaps.map((o) => o.id),
-      [enumComponentId('Status', 'value'), enumComponentId('StatusLegacy', 'value')],
-      'overlap should be sorted by highest overlap and ignore fk components',
+      ['Status.Value', 'Status.LegacyValue'],
+      'overlap should be sorted by highest overlap',
     );
     assert.equal(overlaps[0]!.overlapCount, 2);
     assert.equal(overlaps[1]!.overlapCount, 1);
 
-    mergeIntoComponent(loaded.components, enumComponentId('Status', 'value'), ['active', 'archived']);
+    mergeIntoComponent(loaded.components, 'Status.Value', ['active', 'archived']);
     assert.deepEqual(
-      loaded.components[enumComponentId('Status', 'value')]?.values,
+      loaded.components['Status.Value']?.values,
       ['active', 'archived', 'closed', 'draft'],
       'merge should de-duplicate and sort values',
     );
 
     mergeIntoComponent(loaded.components, 'DoesNotExist', ['x']);
 
-    assert.equal(generateComponentId(loaded.components, 'Status', 'enum'), 'StatusEnum');
-    assert.equal(generateComponentId(loaded.components, 'Language', 'enum'), 'LanguageEnum');
-    assert.equal(generateComponentId(loaded.components, 'CommitteeId', 'fk'), 'CommitteeIdRef2');
-    assert.equal(generateComponentId(loaded.components, 'TypeTitle', 'foreign_value'), 'TypeTitleValue');
+    assert.equal(generateComponentId(loaded.components, 'Status', 'field'), 'StatusField');
+    assert.equal(generateComponentId(loaded.components, 'Committee', 'field'), 'CommitteeField');
 
     removeFieldDecision(loaded.decisions, 'Title');
     assert.ok(!('Title' in loaded.decisions.fields));
-    removeComponent(loaded.components, 'CommitteeIdRef');
-    assert.ok(!('CommitteeIdRef' in loaded.components));
+    removeComponent(loaded.components, 'Committee.Id');
+    assert.ok(!('Committee.Id' in loaded.components));
 
     const missing = await loadDecisions(join(dir, 'missing.json'));
     assert.deepEqual(missing.decisions.fields, {}, 'missing file should return empty decisions');
-    assert.deepEqual(missing.decisions.enums, {}, 'missing file should return empty enums');
     assert.deepEqual(missing.components, {}, 'missing file should return empty components');
 
     await writeFile(file, '{not json', 'utf-8');
