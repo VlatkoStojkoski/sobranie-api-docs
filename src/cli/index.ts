@@ -8,7 +8,7 @@
  */
 
 import { program, InvalidOptionArgumentError } from 'commander';
-import { writeFile, mkdir, access, unlink } from 'node:fs/promises';
+import { writeFile, mkdir, access } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import {
@@ -21,6 +21,7 @@ import {
   copyHarToSession,
   samplesDir,
   decisionsPath,
+  suggestionsPath,
   openApiDir,
 } from './session.js';
 import {
@@ -53,9 +54,14 @@ import { transformSchemas } from '../schema-transform.js';
 import { validateSchemas } from '../validate.js';
 import { emitOpenApi } from '../emit.js';
 import {
-  detectRelationshipConflicts,
   collectRelationshipWarnings,
 } from '../relationships.js';
+import {
+  loadSuggestionsState,
+  saveSuggestionsState,
+  applyUsageToMetrics,
+} from '../llm/state.js';
+import { createSuggestionClient } from '../llm/suggest.js';
 
 import type {
   MethodCorpus,
@@ -65,20 +71,39 @@ import type {
   SharedComponents,
 } from '../types.js';
 import type { Suspect } from '../value-registry.js';
+import type {
+  SuggestionAdvice,
+  SuggestionCacheEntry,
+  SuggestionsState,
+} from '../llm/types.js';
 
 type ReviewMode = 'interactive' | 'batch' | 'auto-scalar';
 type ValidationFailureMode = 'prompt' | 'force';
+type SuggestionsMode = 'on' | 'off';
+type SuggestionsProvider = 'google';
 
 interface RunSessionOptions {
   reviewMode?: ReviewMode;
   assumeBatchEdited: boolean;
   validationFailureMode: ValidationFailureMode;
+  suggestionsMode: SuggestionsMode;
+  suggestionsProvider: SuggestionsProvider;
+  suggestionsModel: string;
+  suggestionsConfidenceThreshold: number;
+  suggestionsInputUsdPer1M?: number;
+  suggestionsOutputUsdPer1M?: number;
 }
 
 interface PipelineCommandOptions {
   reviewMode?: ReviewMode;
   assumeEdited?: boolean;
   forceOnValidationFailure?: boolean;
+  suggestions?: SuggestionsMode;
+  suggestionsProvider?: SuggestionsProvider;
+  suggestionsModel?: string;
+  suggestionsConfidenceThreshold?: number;
+  suggestionsInputUsdPer1M?: number;
+  suggestionsOutputUsdPer1M?: number;
 }
 
 function resolveDecisionComponentId(decision: FieldDecision | undefined): string | undefined {
@@ -104,7 +129,14 @@ function removeLastOccurrence(values: string[], target: string): void {
   }
 }
 
-const RELATIONSHIP_CONFLICTS_FILE = 'relationship-conflicts.json';
+interface SuggestionFetchResult {
+  advice?: SuggestionAdvice;
+  error?: string;
+}
+
+function suggestionTarget(advice: SuggestionAdvice): string | undefined {
+  return advice.reuseComponentId ?? advice.targetFieldId ?? advice.newComponentName;
+}
 
 // ── Pipeline runner ─────────────────────────────────────────────────
 
@@ -113,6 +145,10 @@ async function runSession(
   options: RunSessionOptions = {
     assumeBatchEdited: false,
     validationFailureMode: 'prompt',
+    suggestionsMode: 'off',
+    suggestionsProvider: 'google',
+    suggestionsModel: 'gemini-2.5-flash-lite',
+    suggestionsConfidenceThreshold: 0.6,
   },
 ): Promise<void> {
   let progress = await loadProgress(sessionDir);
@@ -171,10 +207,144 @@ async function runSession(
       const mode = options.reviewMode ?? await promptBatchOrInteractive();
 
       if (mode === 'interactive') {
+        let suggestionState: SuggestionsState | null = null;
+        let suggestionClient: ReturnType<typeof createSuggestionClient> | null = null;
+        const pendingSuggestions = new Map<string, Promise<SuggestionFetchResult>>();
+        const suggestionFilePath = suggestionsPath(sessionDir);
+        const suggestionPricing = {
+          inputUsdPer1M: options.suggestionsInputUsdPer1M,
+          outputUsdPer1M: options.suggestionsOutputUsdPer1M,
+        };
+
+        if (options.suggestionsMode === 'on') {
+          suggestionState = await loadSuggestionsState(
+            suggestionFilePath,
+            options.suggestionsModel,
+            options.suggestionsConfidenceThreshold,
+          );
+          suggestionClient = createSuggestionClient({
+            provider: options.suggestionsProvider,
+            model: options.suggestionsModel,
+          });
+
+          const ready = suggestionClient.isReady();
+          if (!ready.ok) {
+            suggestionClient = null;
+            console.log(`  LLM suggestions unavailable (${ready.reason}). Continuing manual mode.\n`);
+          } else {
+            console.log(
+              `  LLM suggestions enabled (${options.suggestionsProvider}:${options.suggestionsModel}, threshold ${options.suggestionsConfidenceThreshold.toFixed(2)})\n`,
+            );
+          }
+        }
+
+        const persistSuggestionState = async (): Promise<void> => {
+          if (!suggestionState) return;
+          await saveSuggestionsState(suggestionFilePath, suggestionState);
+        };
+
+        const fetchSuggestion = async (suspect: Suspect): Promise<SuggestionFetchResult> => {
+          if (!suggestionState || !suggestionClient) return {};
+          const cached = suggestionState.suggestions[suspect.decisionKey];
+          if (cached) {
+            suggestionState.metrics.cacheHits++;
+            await persistSuggestionState();
+            return { advice: cached.advice };
+          }
+
+          const pending = pendingSuggestions.get(suspect.decisionKey);
+          if (pending) return pending;
+
+          suggestionState.metrics.attemptedCalls++;
+          const promise = (async (): Promise<SuggestionFetchResult> => {
+            const result = await suggestionClient!.suggest({
+              suspect,
+              components,
+              decisions,
+            });
+
+            if (result.advice) {
+              const entry: SuggestionCacheEntry = {
+                model: options.suggestionsModel,
+                createdAt: new Date().toISOString(),
+                latencyMs: result.latencyMs,
+                advice: result.advice,
+                usage: result.usage,
+              };
+              suggestionState!.suggestions[suspect.decisionKey] = entry;
+              suggestionState!.metrics.completedCalls++;
+              applyUsageToMetrics(suggestionState!.metrics, result.usage, suggestionPricing);
+            } else {
+              suggestionState!.metrics.failedCalls++;
+            }
+
+            await persistSuggestionState();
+            return { advice: result.advice, error: result.error };
+          })();
+
+          pendingSuggestions.set(suspect.decisionKey, promise);
+          try {
+            return await promise;
+          } finally {
+            pendingSuggestions.delete(suspect.decisionKey);
+          }
+        };
+
+        const prefetchSuggestion = (suspect: Suspect | undefined): void => {
+          if (!suspect || !suggestionClient || !suggestionState) return;
+          if (suggestionState.suggestions[suspect.decisionKey]) return;
+          if (pendingSuggestions.has(suspect.decisionKey)) return;
+          void fetchSuggestion(suspect);
+        };
+
         let i = startIndex;
+        prefetchSuggestion(undecided[i]);
         while (i < undecided.length) {
           const suspect = undecided[i]!;
-          const result = await promptForSuspect(suspect, components, i, undecided.length);
+          const fetchedSuggestion = await fetchSuggestion(suspect);
+          const shownSuggestion = fetchedSuggestion.advice &&
+            fetchedSuggestion.advice.confidence >= options.suggestionsConfidenceThreshold
+            ? fetchedSuggestion.advice
+            : undefined;
+          if (shownSuggestion && suggestionState) {
+            suggestionState.metrics.suggestionsShown++;
+            await persistSuggestionState();
+          }
+
+          prefetchSuggestion(undecided[i + 1]);
+
+          const promptStartedAt = Date.now();
+          const result = await promptForSuspect(
+            suspect,
+            components,
+            i,
+            undecided.length,
+            shownSuggestion,
+          );
+          const decisionDurationMs = Date.now() - promptStartedAt;
+
+          if (result.action === 'apply' && suggestionState) {
+            suggestionState.metrics.decisionCount++;
+            suggestionState.metrics.decisionTimeMsTotal += decisionDurationMs;
+            if (shownSuggestion) {
+              suggestionState.metrics.decisionsWithSuggestion++;
+              if (result.kind === shownSuggestion.kind) {
+                suggestionState.metrics.acceptedKind++;
+              }
+              const selectedTarget = result.matchesExisting ?? result.componentId;
+              const suggestedTargetId = suggestionTarget(shownSuggestion);
+              if (
+                result.kind === shownSuggestion.kind &&
+                (
+                  (selectedTarget === undefined && suggestedTargetId === undefined)
+                  || selectedTarget === suggestedTargetId
+                )
+              ) {
+                suggestionState.metrics.acceptedExact++;
+              }
+            }
+            await persistSuggestionState();
+          }
 
           if (result.action === 'back') {
             if (i === 0) {
@@ -295,48 +465,6 @@ async function runSession(
     const reloaded = await loadDecisions(decisionsPath(sessionDir));
     decisions = reloaded.decisions;
     components = reloaded.components;
-
-    // Hard gate: each field definition can have at most one index_source and one value_source.
-    // Conflicts must be resolved manually before transform/emit can continue.
-    const conflictsPath = join(sessionDir, RELATIONSHIP_CONFLICTS_FILE);
-    let conflicts = detectRelationshipConflicts(decisions);
-    while (conflicts.length > 0) {
-      await writeFile(
-        conflictsPath,
-        JSON.stringify({
-          message: 'Resolve duplicate source declarations. Keep exactly one source per field per role.',
-          conflicts,
-        }, null, 2),
-        'utf-8',
-      );
-
-      console.error(`\nRelationship conflicts detected (${conflicts.length}).`);
-      console.error(`Resolve: ${conflictsPath}`);
-      console.error(`Then edit: ${decisionsPath(sessionDir)}\n`);
-
-      if (options.assumeBatchEdited) {
-        process.exitCode = 1;
-        return;
-      }
-
-      const ready = await promptContinue('Done resolving relationship conflicts?');
-      if (!ready) {
-        console.log('  Session saved. Resume later to continue.\n');
-        return;
-      }
-
-      const afterEdit = await loadDecisions(decisionsPath(sessionDir));
-      decisions = afterEdit.decisions;
-      components = afterEdit.components;
-      conflicts = detectRelationshipConflicts(decisions);
-    }
-
-    // Conflicts resolved: cleanup temporary conflict file if present.
-    try {
-      await unlink(conflictsPath);
-    } catch {
-      // no-op
-    }
 
     const relationshipWarnings = collectRelationshipWarnings(decisions);
     progress.relationshipWarnings = relationshipWarnings;
@@ -497,6 +625,29 @@ async function runSession(
     console.log();
   }
 
+  if (options.suggestionsMode === 'on') {
+    const state = await loadSuggestionsState(
+      suggestionsPath(sessionDir),
+      options.suggestionsModel,
+      options.suggestionsConfidenceThreshold,
+    );
+    const metrics = state.metrics;
+    const acceptanceRate = metrics.decisionsWithSuggestion > 0
+      ? (metrics.acceptedKind / metrics.decisionsWithSuggestion) * 100
+      : 0;
+    const avgDecisionMs = metrics.decisionCount > 0
+      ? metrics.decisionTimeMsTotal / metrics.decisionCount
+      : 0;
+
+    console.log('Suggestion metrics:');
+    console.log(`  Calls: ${metrics.completedCalls}/${metrics.attemptedCalls} (cache hits: ${metrics.cacheHits}, failed: ${metrics.failedCalls})`);
+    console.log(`  Tokens: in ${metrics.inputTokens}, out ${metrics.outputTokens}, total ${metrics.totalTokens}`);
+    console.log(`  Estimated cost (USD): ${metrics.estimatedCostUsd.toFixed(6)}`);
+    console.log(`  Acceptance (kind match): ${acceptanceRate.toFixed(1)}%`);
+    console.log(`  Avg decision time: ${avgDecisionMs.toFixed(0)} ms`);
+    console.log();
+  }
+
   // ── Done ──
   console.log('═══════════════════════════════════════════');
   console.log(`  Session   : ${sessionDir}`);
@@ -598,6 +749,28 @@ function parseStartAction(value: string): 'new' | 'resume' {
   throw new InvalidOptionArgumentError('action must be one of: new, resume');
 }
 
+function parseSuggestionsMode(value: string): SuggestionsMode {
+  if (value === 'on' || value === 'off') return value;
+  throw new InvalidOptionArgumentError('suggestions must be one of: on, off');
+}
+
+function parseSuggestionsProvider(value: string): SuggestionsProvider {
+  if (value === 'google') return value;
+  throw new InvalidOptionArgumentError('suggestions-provider must be one of: google');
+}
+
+function parseConfidenceThreshold(value: string): number {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 1) return parsed;
+  throw new InvalidOptionArgumentError('suggestions-confidence-threshold must be between 0 and 1');
+}
+
+function parseUsdPer1M(value: string): number {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  throw new InvalidOptionArgumentError('cost-per-1m options must be non-negative numbers');
+}
+
 function configureSessionsDir(sessionsDir?: string): void {
   if (!sessionsDir) return;
   process.env.SOBRANIE_SESSIONS_DIR = resolve(process.cwd(), sessionsDir);
@@ -608,6 +781,12 @@ function toRunSessionOptions(options: PipelineCommandOptions): RunSessionOptions
     reviewMode: options.reviewMode,
     assumeBatchEdited: options.assumeEdited ?? false,
     validationFailureMode: options.forceOnValidationFailure ? 'force' : 'prompt',
+    suggestionsMode: options.suggestions ?? 'off',
+    suggestionsProvider: options.suggestionsProvider ?? 'google',
+    suggestionsModel: options.suggestionsModel ?? 'gemini-2.5-flash-lite',
+    suggestionsConfidenceThreshold: options.suggestionsConfidenceThreshold ?? 0.6,
+    suggestionsInputUsdPer1M: options.suggestionsInputUsdPer1M,
+    suggestionsOutputUsdPer1M: options.suggestionsOutputUsdPer1M,
   };
 }
 
@@ -648,6 +827,39 @@ function addPipelineOptions<T extends import('commander').Command>(command: T): 
       '--force-on-validation-failure',
       'If validation fails, force emit without opening the interactive retry menu',
       false,
+    )
+    .option(
+      '--suggestions <mode>',
+      'LLM suggestions mode: on | off',
+      parseSuggestionsMode,
+      'off',
+    )
+    .option(
+      '--suggestions-provider <provider>',
+      'Suggestion provider (currently: google)',
+      parseSuggestionsProvider,
+      'google',
+    )
+    .option(
+      '--suggestions-model <model>',
+      'Suggestion model id',
+      'gemini-2.5-flash-lite',
+    )
+    .option(
+      '--suggestions-confidence-threshold <n>',
+      'Show suggestions only when confidence >= n (0..1)',
+      parseConfidenceThreshold,
+      0.6,
+    )
+    .option(
+      '--suggestions-input-usd-per-1m <usd>',
+      'Estimated input token cost per 1M tokens (for metrics)',
+      parseUsdPer1M,
+    )
+    .option(
+      '--suggestions-output-usd-per-1m <usd>',
+      'Estimated output token cost per 1M tokens (for metrics)',
+      parseUsdPer1M,
     );
 }
 

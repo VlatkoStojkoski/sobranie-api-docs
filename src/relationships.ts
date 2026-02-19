@@ -38,21 +38,9 @@ function sourceMaps(decisions: Decisions): {
 }
 
 export function detectRelationshipConflicts(decisions: Decisions): RelationshipConflict[] {
-  const { indexSources, valueSources } = sourceMaps(decisions);
-  const conflicts: RelationshipConflict[] = [];
-
-  for (const [field, sources] of indexSources.entries()) {
-    if (sources.length > 1) {
-      conflicts.push({ role: 'index_source', field, sources });
-    }
-  }
-  for (const [field, sources] of valueSources.entries()) {
-    if (sources.length > 1) {
-      conflicts.push({ role: 'value_source', field, sources });
-    }
-  }
-
-  return conflicts.sort((a, b) => a.field.localeCompare(b.field) || a.role.localeCompare(b.role));
+  // Multi-source is supported: duplicate index_source/value_source declarations are not conflicts.
+  void decisions;
+  return [];
 }
 
 export function collectRelationshipWarnings(decisions: Decisions): string[] {

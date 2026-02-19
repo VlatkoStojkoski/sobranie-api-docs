@@ -6,6 +6,7 @@
 import { select, confirm, input } from '@inquirer/prompts';
 import type { FieldKind, SharedComponents, SharedComponent } from '../types.js';
 import type { Suspect } from '../value-registry.js';
+import type { SuggestionAdvice } from '../llm/types.js';
 import {
   findOverlappingComponents,
   generateComponentId,
@@ -46,6 +47,7 @@ export async function promptForSuspect(
   components: SharedComponents,
   index: number,
   total: number,
+  suggestion?: SuggestionAdvice,
 ): Promise<PromptResult> {
   const { keyName, entry, methodName, direction } = suspect;
   const uniqueCount = entry.values.size;
@@ -56,6 +58,17 @@ export async function promptForSuspect(
   console.log(`  Method: ${methodName}  |  Side: ${direction}  |  Parent: ${suspect.parentPath}`);
   console.log(`  Unique values: ${uniqueCount}  |  Total occurrences: ${totalOccurrences}`);
   console.log(`  Values: ${formatValues(entry.values)}`);
+  if (suggestion) {
+    const suggestionTarget = suggestedTargetLabel(suggestion);
+    const sourceHint = suggestion.sourceReferenceFieldId
+      ? ` | source hint: ${suggestion.sourceReferenceFieldId}`
+      : '';
+    console.log(
+      `  Suggested: ${suggestion.kind} (${suggestion.confidence.toFixed(2)})`
+      + `${suggestionTarget ? ` -> ${suggestionTarget}` : ''}${sourceHint}`,
+    );
+    console.log(`  Why: ${suggestion.reason}`);
+  }
 
   // Check for overlapping existing components (enum-only reuse heuristic)
   const valuesArr = Array.from(entry.values);
@@ -68,18 +81,33 @@ export async function promptForSuspect(
     }
   }
 
-  const kindSelection = await select<FieldKind | '__back__'>({
-    message: `What is "${keyName}"?`,
-    choices: [
-      { value: '__back__' as const, name: 'Go back to previous field (undo last decision)' },
-      { value: 'scalar' as const, name: 'Scalar (plain string/number/boolean)' },
-      { value: 'enum' as const, name: 'Enum (closed set of known values)' },
-      { value: 'fk' as const, name: 'Foreign Key (reference to another entity)' },
-      { value: 'foreign_value' as const, name: 'Foreign Value (resolved/display value from another entity)' },
-      { value: 'index_source' as const, name: 'Index Source (actual source field for a foreign key)' },
-      { value: 'value_source' as const, name: 'Value Source (actual source field for a foreign value)' },
-    ],
-  });
+  const selectChoices: { value: FieldKind | '__back__' | '__accept__'; name: string }[] = [];
+  const canAccept = canAcceptSuggestion(suggestion, components);
+  if (canAccept && suggestion) {
+    selectChoices.push({
+      value: '__accept__',
+      name: `Accept suggestion: ${suggestion.kind}${suggestedTargetLabel(suggestion) ? ` -> ${suggestedTargetLabel(suggestion)}` : ''}`,
+    });
+  }
+  selectChoices.push({ value: '__back__', name: 'Go back to previous field (undo last decision)' });
+  selectChoices.push({ value: 'scalar', name: 'Scalar (plain string/number/boolean)' });
+  selectChoices.push({ value: 'enum', name: 'Enum (closed set of known values)' });
+  selectChoices.push({ value: 'fk', name: 'Foreign Key (reference to another entity)' });
+  selectChoices.push({ value: 'foreign_value', name: 'Foreign Value (resolved/display value from another entity)' });
+  selectChoices.push({ value: 'index_source', name: 'Index Source (actual source field for a foreign key)' });
+  selectChoices.push({ value: 'value_source', name: 'Value Source (actual source field for a foreign value)' });
+
+  let kindSelection: FieldKind | '__back__' | '__accept__';
+  while (true) {
+    kindSelection = await select<FieldKind | '__back__' | '__accept__'>({
+      message: `What is "${keyName}"?`,
+      choices: selectChoices,
+    });
+    if (kindSelection !== '__accept__') break;
+    const accepted = applyAcceptedSuggestion(suggestion, components, keyName, entry.values);
+    if (accepted) return accepted;
+    console.log('  Suggestion is missing required details. Choose manually.\n');
+  }
 
   if (kindSelection === '__back__') {
     return { action: 'back' };
@@ -93,9 +121,13 @@ export async function promptForSuspect(
 
   // For enum, check if it matches an existing component
   if (kind === 'enum' && overlaps.length > 0) {
+    const suggestedReuse = suggestion?.kind === 'enum'
+      ? suggestion.reuseComponentId
+      : undefined;
+    const canDefaultToReuse = !!suggestedReuse && overlaps.some((o) => o.id === suggestedReuse);
     const matchExisting = await confirm({
       message: 'Does this match an existing component?',
-      default: false,
+      default: canDefaultToReuse,
     });
 
     if (matchExisting) {
@@ -134,9 +166,11 @@ export async function promptForSuspect(
 
   // Create or link a field definition.
   const defaultFieldId = suggestFieldId(keyName, kind);
+  const suggestedFieldId = suggestedFieldIdForKind(kind, suggestion);
   const fieldId = await input({
     message: kind === 'enum' ? 'Component name:' : 'Field definition (e.g. Committee.Id):',
-    default: kind === 'enum' ? generateComponentId(components, keyName, kind) : defaultFieldId,
+    default: suggestedFieldId
+      ?? (kind === 'enum' ? generateComponentId(components, keyName, kind) : defaultFieldId),
   });
 
   const existing = components[fieldId];
@@ -226,6 +260,88 @@ function suggestFieldId(keyName: string, kind: FieldKind): string {
   if (namePrefix) return `${namePrefix}.Name`;
 
   return keyName.includes('.') ? keyName : `${keyName}.${keyName}`;
+}
+
+function suggestedFieldIdForKind(
+  kind: FieldKind,
+  suggestion?: SuggestionAdvice,
+): string | undefined {
+  if (!suggestion) return undefined;
+  if (suggestion.reuseComponentId && kind === 'enum') return suggestion.reuseComponentId;
+  if (suggestion.targetFieldId) return suggestion.targetFieldId;
+  if (suggestion.newComponentName && kind === 'enum') return suggestion.newComponentName;
+  return undefined;
+}
+
+function suggestedTargetLabel(suggestion: SuggestionAdvice): string | undefined {
+  return suggestion.reuseComponentId
+    ?? suggestion.targetFieldId
+    ?? suggestion.newComponentName;
+}
+
+function canAcceptSuggestion(
+  suggestion: SuggestionAdvice | undefined,
+  components: SharedComponents,
+): boolean {
+  if (!suggestion) return false;
+  if (suggestion.kind === 'scalar') return true;
+
+  if (suggestion.kind === 'enum') {
+    const reuse = nonEmpty(suggestion.reuseComponentId);
+    if (reuse && components[reuse]) return true;
+    return !!(nonEmpty(suggestion.newComponentName) || nonEmpty(suggestion.targetFieldId));
+  }
+
+  return !!nonEmpty(suggestion.targetFieldId);
+}
+
+function applyAcceptedSuggestion(
+  suggestion: SuggestionAdvice | undefined,
+  components: SharedComponents,
+  keyName: string,
+  values: Set<string | number | boolean>,
+): PromptResult | undefined {
+  if (!suggestion) return undefined;
+
+  if (suggestion.kind === 'scalar') {
+    return { action: 'apply', kind: 'scalar' };
+  }
+
+  const valuesArr = Array.from(values);
+  const inferredType = inferBaseType(values);
+
+  if (suggestion.kind === 'enum') {
+    const reuse = nonEmpty(suggestion.reuseComponentId);
+    if (reuse && components[reuse]) {
+      return { action: 'apply', kind: 'enum', matchesExisting: reuse };
+    }
+
+    const newId = nonEmpty(suggestion.newComponentName) ?? nonEmpty(suggestion.targetFieldId);
+    if (!newId) return undefined;
+
+    if (!components[newId]) {
+      const component = componentForKind('enum', inferredType, valuesArr, keyName);
+      if (component) addComponent(components, newId, component);
+    }
+
+    return { action: 'apply', kind: 'enum', componentId: newId };
+  }
+
+  const fieldId = nonEmpty(suggestion.targetFieldId);
+  if (!fieldId) return undefined;
+
+  if (!components[fieldId]) {
+    const component = componentForKind(suggestion.kind, inferredType, valuesArr, keyName);
+    if (component) addComponent(components, fieldId, component);
+  }
+
+  return { action: 'apply', kind: suggestion.kind, componentId: fieldId };
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 // ── Batch review (edit decisions JSON) ──────────────────────────────

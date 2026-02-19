@@ -38,16 +38,7 @@ function main(): void {
   };
 
   const conflicts = detectRelationshipConflicts(decisions);
-  assert.deepEqual(conflicts, [
-    {
-      role: 'value_source',
-      field: 'Committee.Title',
-      sources: [
-        makeScopedFieldKey('D', 'response', '$', 'CommitteeTitleSource1'),
-        makeScopedFieldKey('E', 'response', '$', 'CommitteeTitleSource2'),
-      ],
-    },
-  ]);
+  assert.deepEqual(conflicts, [], 'multi-source declarations should not conflict');
 
   const warnings = collectRelationshipWarnings(decisions);
   assert.ok(

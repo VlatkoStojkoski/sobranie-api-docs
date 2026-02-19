@@ -151,6 +151,10 @@ export function decisionsPath(sessionDir: string): string {
   return join(sessionDir, 'decisions.json');
 }
 
+export function suggestionsPath(sessionDir: string): string {
+  return join(sessionDir, 'suggestions.json');
+}
+
 export function openApiDir(sessionDir: string): string {
   return join(sessionDir, 'openapi');
 }

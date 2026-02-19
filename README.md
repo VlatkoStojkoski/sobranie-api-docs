@@ -29,6 +29,10 @@ pnpm start        # Interactive: new session or resume existing
 - `--review-mode <interactive|batch|auto-scalar>`: control suspect classification flow
 - `--assume-edited`: in batch mode, continue without confirmation prompt
 - `--force-on-validation-failure`: emit even when validation fails (non-interactive fallback)
+- `--suggestions <on|off>`: enable advisory LLM suggestions during interactive suspect review
+- `--suggestions-model <id>`: suggestion model id (default: `gemini-2.5-flash-lite`)
+- `--suggestions-confidence-threshold <0..1>`: show only confident suggestions (default: `0.6`)
+- `--suggestions-input-usd-per-1m <usd>` / `--suggestions-output-usd-per-1m <usd>`: optional pricing rates for estimated cost metrics
 - `start --action <new|resume>`: skip menu selection
 - `resume --latest`: resume newest session without prompt
 
@@ -48,7 +52,7 @@ Record HAR (Dev Proxy) → Extract + Normalize → Infer Schemas (quicktype)
 5. **Prompt** — For each suspect, classify as:
    `scalar`, `enum`, `fk`, `foreign_value`, `index_source`, or `value_source`.
    You can go back during prompting to undo the previous field.
-6. **Relationship checks** — Detect duplicate source declarations (hard gate) and unresolved refs (warnings).
+6. **Relationship checks** — Detect unresolved refs (warnings). Multiple sources per shared field are allowed.
 7. **Transform** — Inject `$ref` and `x-relationship` / `x-model-source` metadata.
 8. **Validate** — Every sample must validate against its schema. Blocks emit until all pass (unless forced).
 9. **Emit** — Multi-file OpenAPI output.
@@ -62,7 +66,7 @@ sessions/2025-02-16T14-30-00-000Z/
   har/input.har          # Captured HAR
   samples/               # Extracted request/response JSON per method
   decisions.json         # User decisions + shared components
-  relationship-conflicts.json   # Temporary conflict file (only when source conflicts exist)
+  suggestions.json       # Cached LLM suggestions + usage/acceptance/cost metrics
   progress.json          # Current step, undo stack
   openapi/               # Generated spec
     openapi.yaml         # Root (path + schema $refs)
@@ -87,7 +91,7 @@ Relationship warnings are saved in `progress.json`.
 
 Field IDs are editable and typically use dot notation, e.g. `Committee.Id`, `Committee.Title`.
 Different scoped fields can intentionally point to the same field ID.
-If multiple sources are marked for the same field ID, emit is blocked until resolved.
+Multiple sources can be marked for the same field ID.
 
 ## Relationship Metadata
 
@@ -143,3 +147,4 @@ src/
 
 - Node.js 18+
 - [Dev Proxy](https://learn.microsoft.com/en-us/microsoft-cloud/dev/dev-proxy/) for recording (macOS: `brew tap dotnet/dev-proxy && brew install dev-proxy`)
+- For LLM suggestions: set `GOOGLE_GENERATIVE_AI_API_KEY`
