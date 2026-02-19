@@ -35,19 +35,23 @@ function main(): void {
         componentId: 'Other.Title',
       },
     },
+    enums: {},
   };
 
   const conflicts = detectRelationshipConflicts(decisions);
   assert.deepEqual(conflicts, [], 'multi-source declarations should not conflict');
 
-  const warnings = collectRelationshipWarnings(decisions);
+  const warnings = collectRelationshipWarnings(decisions, {
+    'Committee.Id': { kind: 'fk', baseType: 'integer', values: [] },
+    'Committee.Title': { kind: 'foreign_value', baseType: 'string', values: [] },
+  });
   assert.ok(
-    warnings.some((w) => w.includes('Other.Id') && w.includes('no index_source')),
-    'missing index source should generate warning for fk refs',
+    warnings.some((w) => w.includes('Other.Id') && w.includes('undefined model field')),
+    'missing model field should generate warning for fk refs',
   );
   assert.ok(
-    warnings.some((w) => w.includes('Other.Title') && w.includes('no value_source')),
-    'missing value source should generate warning for foreign value refs',
+    warnings.some((w) => w.includes('Other.Title') && w.includes('undefined model field')),
+    'missing model field should generate warning for foreign value refs',
   );
   assert.ok(
     !warnings.some((w) => w.includes('Committee.Id') || w.includes('Committee.Title')),

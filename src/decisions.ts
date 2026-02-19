@@ -4,12 +4,21 @@
  */
 
 import { readFile, writeFile } from 'node:fs/promises';
-import type { Decisions, FieldDecision, SharedComponents, SharedComponent, ScopeDirection } from './types.js';
+import type {
+  Decisions,
+  FieldDecision,
+  SharedComponents,
+  SharedComponent,
+  ScopeDirection,
+  EnumDefinition,
+} from './types.js';
 
 // ── Serializable format (JSON-friendly) ─────────────────────────────
 
 interface DecisionsFile {
+  version: 3;
   fields: Record<string, FieldDecision>;
+  enums: Record<string, EnumDefinition>;
   components: SharedComponents;
 }
 
@@ -17,7 +26,7 @@ interface DecisionsFile {
 
 export function createEmptyDecisions(): { decisions: Decisions; components: SharedComponents } {
   return {
-    decisions: { fields: {} },
+    decisions: { fields: {}, enums: {} },
     components: {},
   };
 }
@@ -25,14 +34,37 @@ export function createEmptyDecisions(): { decisions: Decisions; components: Shar
 export async function loadDecisions(path: string): Promise<{ decisions: Decisions; components: SharedComponents }> {
   try {
     const raw = await readFile(path, 'utf-8');
-    const data: DecisionsFile = JSON.parse(raw);
+    const data = JSON.parse(raw) as DecisionsFile;
+    if (!isDecisionsFile(data)) {
+      throw new Error('Invalid decisions.json schema');
+    }
     return {
-      decisions: { fields: data.fields ?? {} },
+      decisions: { fields: data.fields ?? {}, enums: data.enums ?? {} },
       components: data.components ?? {},
     };
-  } catch {
-    return createEmptyDecisions();
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return createEmptyDecisions();
+    }
+    throw error;
   }
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return !!error
+    && typeof error === 'object'
+    && 'code' in error
+    && (error as { code?: string }).code === 'ENOENT';
+}
+
+function isDecisionsFile(value: unknown): value is DecisionsFile {
+  if (!value || typeof value !== 'object') return false;
+  const obj = value as { version?: unknown; fields?: unknown; enums?: unknown; components?: unknown };
+  if (obj.version !== 3) return false;
+  if (!obj.fields || typeof obj.fields !== 'object') return false;
+  if (!obj.enums || typeof obj.enums !== 'object') return false;
+  if (!obj.components || typeof obj.components !== 'object') return false;
+  return true;
 }
 
 /** Optional reference for batch edit: decisionKey -> metadata + values */
@@ -53,7 +85,9 @@ export async function saveDecisions(
   suspectReference?: SuspectReference,
 ): Promise<void> {
   const data: DecisionsFile & { _suspectValues?: SuspectReference } = {
+    version: 3,
     fields: decisions.fields,
+    enums: decisions.enums,
     components,
   };
   if (suspectReference && Object.keys(suspectReference).length > 0) {
@@ -187,4 +221,12 @@ export function generateComponentId(
   let i = 2;
   while (`${base}${i}` in components) i++;
   return `${base}${i}`;
+}
+
+export function enumComponentId(
+  enumName: string,
+  role: 'id' | 'value',
+): string {
+  const safe = enumName.trim().replace(/[^a-zA-Z0-9_]/g, '_') || 'Enum';
+  return `Enum_${safe}_${role === 'id' ? 'Id' : 'Value'}`;
 }

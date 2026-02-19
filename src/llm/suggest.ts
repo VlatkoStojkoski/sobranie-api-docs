@@ -8,7 +8,7 @@ import { findOverlappingComponents } from '../decisions.js';
 import type { SuggestionAdvice, SuggestionUsage } from './types.js';
 
 const SUGGESTION_SCHEMA = z.object({
-  kind: z.enum(['scalar', 'enum', 'fk', 'foreign_value', 'index_source', 'value_source']),
+  kind: z.enum(['scalar', 'enum_id', 'enum_value', 'fk', 'foreign_value', 'index_source', 'value_source']),
   confidence: z.number().min(0).max(1),
   reason: z.string().min(1).max(220),
   targetFieldId: z.string().min(1).max(120).optional(),
@@ -24,10 +24,12 @@ export interface SuggestionRequest {
 }
 
 export interface SuggestionResult {
+  prompt: string;
   advice?: SuggestionAdvice;
   usage?: SuggestionUsage;
   latencyMs: number;
   error?: string;
+  rawResponse?: Record<string, unknown>;
 }
 
 export interface SuggestionClient {
@@ -58,9 +60,11 @@ class GoogleSuggestionClient implements SuggestionClient {
   }
 
   async suggest(input: SuggestionRequest): Promise<SuggestionResult> {
+    const prompt = buildPrompt(input);
     const ready = this.isReady();
     if (!ready.ok) {
       return {
+        prompt,
         latencyMs: 0,
         error: ready.reason,
       };
@@ -81,19 +85,22 @@ class GoogleSuggestionClient implements SuggestionClient {
           'Prefer conservative suggestions and do not over-assert confidence.',
           'Use kind=scalar when evidence is weak.',
         ].join(' '),
-        prompt: buildPrompt(input),
+        prompt,
       });
 
       const usage = usageFromResult(result.usage);
       const advice = normalizeAdvice(result.output);
 
       return {
+        prompt,
         advice,
         usage,
         latencyMs: Date.now() - startedAt,
+        rawResponse: result.output as Record<string, unknown>,
       };
     } catch (error) {
       return {
+        prompt,
         latencyMs: Date.now() - startedAt,
         error: error instanceof Error ? error.message : String(error),
       };
@@ -158,7 +165,7 @@ function buildPrompt(input: SuggestionRequest): string {
     existingComponents: overlapping,
     decisionsContext: decisionSample,
     outputRequirements: {
-      kind: ['scalar', 'enum', 'fk', 'foreign_value', 'index_source', 'value_source'],
+      kind: ['scalar', 'enum_id', 'enum_value', 'fk', 'foreign_value', 'index_source', 'value_source'],
       confidenceRange: '0..1',
       reason: 'single short sentence',
       optionalFields: [
@@ -168,8 +175,7 @@ function buildPrompt(input: SuggestionRequest): string {
         'sourceReferenceFieldId',
       ],
       guidance: [
-        'If kind is enum and an existing enum appears equivalent, set reuseComponentId.',
-        'If creating a new enum/component, set newComponentName.',
+        'If kind is enum_id or enum_value, set newComponentName to the enum name.',
         'If kind is fk/foreign_value/index_source/value_source, set targetFieldId.',
         'If kind is fk or foreign_value and companion source is likely known, set sourceReferenceFieldId.',
       ],

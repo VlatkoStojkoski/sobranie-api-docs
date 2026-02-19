@@ -2,7 +2,7 @@
 
 Reverse-engineer the undocumented [sobranie.mk](https://www.sobranie.mk) RPC-style web API into a high-quality OpenAPI 3.0 specification.
 
-The API multiplexes many logical methods through a single endpoint (`POST /Routing/MakePostRequest`) using a `MethodName` field. This CLI captures traffic, infers schemas, and lets you classify fields (enum/fk/foreign-value/source roles) to produce clean, typed specs with relationship metadata.
+The API multiplexes many logical methods through a single endpoint (`POST /Routing/MakePostRequest`) using a `MethodName` field. This CLI captures traffic, infers schemas, and lets you classify fields (enum_id/enum_value/fk/foreign-value/source roles) to produce clean, typed specs with relationship metadata.
 
 ## Quick start
 
@@ -50,7 +50,9 @@ Record HAR (Dev Proxy) → Extract + Normalize → Infer Schemas (quicktype)
 4. **Collect Values** — Walk all samples and collect leaf values per scoped field key:
    `method::request|response::parentPath::fieldName`.
 5. **Prompt** — For each suspect, classify as:
-   `scalar`, `enum`, `fk`, `foreign_value`, `index_source`, or `value_source`.
+   `scalar`, `enum_id`, `enum_value`, `fk`, `foreign_value`, `index_source`, or `value_source`.
+   For `fk`/`foreign_value`/source kinds, pick/create a model and field (`Model.Field`).
+   For enum kinds, pick/create an enum name.
    You can go back during prompting to undo the previous field.
 6. **Relationship checks** — Detect unresolved refs (warnings). Multiple sources per shared field are allowed.
 7. **Transform** — Inject `$ref` and `x-relationship` / `x-model-source` metadata.
@@ -65,25 +67,32 @@ Each run is a session stored in `sessions/{timestamp}/`:
 sessions/2025-02-16T14-30-00-000Z/
   har/input.har          # Captured HAR
   samples/               # Extracted request/response JSON per method
-  decisions.json         # User decisions + shared components
+  decisions.json         # User decisions + model-field definitions (version 2)
   suggestions.json       # Cached LLM suggestions + usage/acceptance/cost metrics
+  logs/
+    prompts.jsonl        # Every interactive prompt + selected/typed response
+    llm.jsonl            # LLM prompt payloads, responses, latency, token usage
+    pipeline.jsonl       # Step transitions, decisions, validation/emit summaries
   progress.json          # Current step, undo stack
   openapi/               # Generated spec
     openapi.yaml         # Root (path + schema $refs)
     paths/*.yaml         # One per method
     schemas/*/Request.yaml, Response.yaml
     schemas/shared/*.yaml  # Enums, FK refs
+    schemas/models/*.yaml  # Global model object schemas
     openapi.bundled.json   # Single-file version
 ```
 
 Sessions can be resumed at any step.
 During interactive prompting you can undo/go back to the previous field.
+During prompts, press `Ctrl+R` to reload `decisions.json` from disk and restart the current prompt.
 Relationship warnings are saved in `progress.json`.
 
 ## Classification Kinds
 
 - **Scalar**: left as quicktype inferred it.
-- **Enum**: closed set of values.
+- **Enum ID (`enum_id`)**: integer ordinal/id side of an enum.
+- **Enum Value (`enum_value`)**: display/value side of an enum.
 - **Foreign Key (`fk`)**: references a global field definition (e.g. `Committee.Id`).
 - **Foreign Value (`foreign_value`)**: references a global resolved/display field definition (e.g. `Committee.Title`).
 - **Index Source (`index_source`)**: marks the canonical source field for an `fk` definition.
@@ -101,7 +110,7 @@ Multiple sources can be marked for the same field ID.
   - `x-relationship: { role: "source", field: "<FieldId>" }`
   - `x-model-source: { role: "source", field: "<FieldId>" }`
 
-Unresolved forward refs are allowed (emit continues) but warnings are printed and stored in `progress.json`.
+Unresolved model-field refs are allowed (emit continues) but warnings are printed and stored in `progress.json`.
 
 ## Guarantees
 

@@ -4,15 +4,150 @@
  */
 
 import { select, confirm, input } from '@inquirer/prompts';
-import type { FieldKind, SharedComponents, SharedComponent } from '../types.js';
+import { emitKeypressEvents } from 'node:readline';
+import type { FieldKind, SharedComponents, SharedComponent, EnumRegistry } from '../types.js';
 import type { Suspect } from '../value-registry.js';
 import type { SuggestionAdvice } from '../llm/types.js';
 import {
-  findOverlappingComponents,
-  generateComponentId,
   addComponent,
-  mergeIntoComponent,
+  enumComponentId,
 } from '../decisions.js';
+
+export interface PromptTraceEvent {
+  timestamp: string;
+  promptType: 'select' | 'confirm' | 'input';
+  context: string;
+  message: string;
+  response: string | number | boolean | null;
+  choices?: Array<{ name: string; value: string }>;
+}
+
+export type PromptTraceLogger = (event: PromptTraceEvent) => Promise<void> | void;
+export type PromptReloadHandler = () => Promise<void> | void;
+
+let promptTraceLogger: PromptTraceLogger | null = null;
+let promptReloadHandler: PromptReloadHandler | null = null;
+let activePromptAbortController: AbortController | null = null;
+let reloadRequested = false;
+let keyListenerAttached = false;
+
+export function setPromptTraceLogger(logger: PromptTraceLogger | null): void {
+  promptTraceLogger = logger;
+}
+
+export function setPromptReloadHandler(handler: PromptReloadHandler | null): void {
+  promptReloadHandler = handler;
+  ensureReloadKeyListener();
+}
+
+async function tracePrompt(event: Omit<PromptTraceEvent, 'timestamp'>): Promise<void> {
+  if (!promptTraceLogger) return;
+  try {
+    await promptTraceLogger({
+      timestamp: new Date().toISOString(),
+      ...event,
+    });
+  } catch {
+    // ignore logging failures; do not break UX
+  }
+}
+
+function ensureReloadKeyListener(): void {
+  if (keyListenerAttached) return;
+  if (!process.stdin.isTTY) return;
+
+  emitKeypressEvents(process.stdin);
+  process.stdin.on('keypress', (_str, key: { ctrl?: boolean; name?: string }) => {
+    if (!key?.ctrl || key.name !== 'r') return;
+    reloadRequested = true;
+    activePromptAbortController?.abort();
+  });
+  keyListenerAttached = true;
+}
+
+async function runWithPromptResync<T>(
+  context: string,
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  while (true) {
+    reloadRequested = false;
+    const abortController = new AbortController();
+    activePromptAbortController = abortController;
+    try {
+      return await run(abortController.signal);
+    } catch (error) {
+      if (reloadRequested) {
+        await tracePrompt({
+          promptType: 'input',
+          context: `${context}.reload`,
+          message: 'Ctrl+R reload requested',
+          response: 'reloaded',
+        });
+        if (promptReloadHandler) {
+          await promptReloadHandler();
+        }
+        continue;
+      }
+      throw error;
+    } finally {
+      if (activePromptAbortController === abortController) {
+        activePromptAbortController = null;
+      }
+    }
+  }
+}
+
+async function tracedSelect<T extends string>(
+  context: string,
+  params: {
+    message: string;
+    choices: Array<{ value: T; name: string }>;
+  },
+): Promise<T> {
+  const value = await runWithPromptResync(context, (signal) => select<T>(params, { signal }));
+  await tracePrompt({
+    promptType: 'select',
+    context,
+    message: params.message,
+    response: String(value),
+    choices: params.choices.map((c) => ({ name: c.name, value: String(c.value) })),
+  });
+  return value;
+}
+
+async function tracedConfirm(
+  context: string,
+  params: {
+    message: string;
+    default?: boolean;
+  },
+): Promise<boolean> {
+  const value = await runWithPromptResync(context, (signal) => confirm(params, { signal }));
+  await tracePrompt({
+    promptType: 'confirm',
+    context,
+    message: params.message,
+    response: value,
+  });
+  return value;
+}
+
+async function tracedInput(
+  context: string,
+  params: {
+    message: string;
+    default?: string;
+  },
+): Promise<string> {
+  const value = await runWithPromptResync(context, (signal) => input(params, { signal }));
+  await tracePrompt({
+    promptType: 'input',
+    context,
+    message: params.message,
+    response: value,
+  });
+  return value;
+}
 
 // ── Format helpers ──────────────────────────────────────────────────
 
@@ -26,11 +161,9 @@ function formatValues(values: Set<string | number | boolean>, max: number = 10):
   return arr.slice(0, max).join(', ') + ` ... (+${arr.length - max} more)`;
 }
 
-function formatComponent(id: string, comp: SharedComponent): string {
-  const vals = comp.values.length > 0
-    ? ` [${comp.values.slice(0, 5).map(String).join(', ')}${comp.values.length > 5 ? '...' : ''}]`
-    : '';
-  return `${id} (${comp.kind}, ${comp.baseType}${vals})`;
+interface ModelFieldRef {
+  modelName: string;
+  fieldName: string;
 }
 
 // ── Prompt for a single suspect ─────────────────────────────────────
@@ -40,11 +173,13 @@ export interface PromptResult {
   kind?: FieldKind;
   componentId?: string;
   matchesExisting?: string;
+  enumName?: string;
 }
 
 export async function promptForSuspect(
   suspect: Suspect,
   components: SharedComponents,
+  enums: EnumRegistry,
   index: number,
   total: number,
   suggestion?: SuggestionAdvice,
@@ -70,19 +205,10 @@ export async function promptForSuspect(
     console.log(`  Why: ${suggestion.reason}`);
   }
 
-  // Check for overlapping existing components (enum-only reuse heuristic)
   const valuesArr = Array.from(entry.values);
-  const overlaps = findOverlappingComponents(components, valuesArr);
-
-  if (overlaps.length > 0) {
-    console.log(`  Overlapping components found:`);
-    for (const o of overlaps.slice(0, 5)) {
-      console.log(`    - ${formatComponent(o.id, o.component)} (${o.overlapCount} shared values)`);
-    }
-  }
 
   const selectChoices: { value: FieldKind | '__back__' | '__accept__'; name: string }[] = [];
-  const canAccept = canAcceptSuggestion(suggestion, components);
+  const canAccept = canAcceptSuggestion(suggestion);
   if (canAccept && suggestion) {
     selectChoices.push({
       value: '__accept__',
@@ -91,7 +217,8 @@ export async function promptForSuspect(
   }
   selectChoices.push({ value: '__back__', name: 'Go back to previous field (undo last decision)' });
   selectChoices.push({ value: 'scalar', name: 'Scalar (plain string/number/boolean)' });
-  selectChoices.push({ value: 'enum', name: 'Enum (closed set of known values)' });
+  selectChoices.push({ value: 'enum_id', name: 'Enum ID (ordinal integer id)' });
+  selectChoices.push({ value: 'enum_value', name: 'Enum Value (display/value label)' });
   selectChoices.push({ value: 'fk', name: 'Foreign Key (reference to another entity)' });
   selectChoices.push({ value: 'foreign_value', name: 'Foreign Value (resolved/display value from another entity)' });
   selectChoices.push({ value: 'index_source', name: 'Index Source (actual source field for a foreign key)' });
@@ -99,7 +226,7 @@ export async function promptForSuspect(
 
   let kindSelection: FieldKind | '__back__' | '__accept__';
   while (true) {
-    kindSelection = await select<FieldKind | '__back__' | '__accept__'>({
+    kindSelection = await tracedSelect<FieldKind | '__back__' | '__accept__'>('suspect.kind', {
       message: `What is "${keyName}"?`,
       choices: selectChoices,
     });
@@ -119,62 +246,35 @@ export async function promptForSuspect(
     return { action: 'apply', kind };
   }
 
-  // For enum, check if it matches an existing component
-  if (kind === 'enum' && overlaps.length > 0) {
-    const suggestedReuse = suggestion?.kind === 'enum'
-      ? suggestion.reuseComponentId
-      : undefined;
-    const canDefaultToReuse = !!suggestedReuse && overlaps.some((o) => o.id === suggestedReuse);
-    const matchExisting = await confirm({
-      message: 'Does this match an existing component?',
-      default: canDefaultToReuse,
-    });
-
-    if (matchExisting) {
-      const choices = overlaps.map((o) => ({
-        value: o.id,
-        name: formatComponent(o.id, o.component),
-      }));
-
-      const matchId = await select({
-        message: 'Which component does it match?',
-        choices,
-      });
-
-      // If the value sets differ, offer to merge
-      const matchComp = components[matchId]!;
-      const matchSet = new Set(matchComp.values);
-      const newValues = valuesArr.filter((v) => !matchSet.has(v));
-
-      if (newValues.length > 0 && kind === 'enum') {
-        const shouldMerge = await confirm({
-          message: `Merge ${newValues.length} new value(s) into ${matchId}? (${newValues.map(String).join(', ')})`,
-          default: true,
-        });
-
-        if (shouldMerge) {
-          mergeIntoComponent(components, matchId, valuesArr);
-        }
-      }
-
-      return { action: 'apply', kind, matchesExisting: matchId };
-    }
-  }
-
   // Determine base type from values
   const inferredType = inferBaseType(entry.values);
 
-  // Create or link a field definition.
-  const defaultFieldId = suggestFieldId(keyName, kind);
-  const suggestedFieldId = suggestedFieldIdForKind(kind, suggestion);
-  const fieldId = await input({
-    message: kind === 'enum' ? 'Component name:' : 'Field definition (e.g. Committee.Id):',
-    default: suggestedFieldId
-      ?? (kind === 'enum' ? generateComponentId(components, keyName, kind) : defaultFieldId),
-  });
+  if (kind === 'enum_id' || kind === 'enum_value') {
+    const suggestedEnumName = nonEmpty(suggestion?.newComponentName)
+      ?? nonEmpty(suggestion?.targetFieldId)
+      ?? suggestModelName(keyName);
+    const enumName = await promptEnumName(enums, suggestedEnumName);
+    const fieldId = enumComponentId(enumName, kind === 'enum_id' ? 'id' : 'value');
 
-  const existing = components[fieldId];
-  if (!existing) {
+    if (!components[fieldId]) {
+      const component = componentForKind(kind, inferredType, valuesArr, keyName);
+      if (component) {
+        addComponent(components, fieldId, component);
+      }
+    }
+
+    return { action: 'apply', kind, componentId: fieldId, enumName };
+  }
+
+  // Create or link a model field definition.
+  const modelField = await promptForModelField(kind, components, keyName, suggestion);
+  const fieldId = `${modelField.modelName}.${modelField.fieldName}`;
+
+  const shouldDefineField = (
+    kind === 'index_source'
+    || kind === 'value_source'
+  );
+  if (shouldDefineField && !components[fieldId]) {
     const component = componentForKind(kind, inferredType, valuesArr, keyName);
     if (component) {
       addComponent(components, fieldId, component);
@@ -193,15 +293,16 @@ function componentForKind(
   if (kind === 'scalar') return null;
 
   const componentKind = (
-    kind === 'index_source' ? 'fk'
-      : kind === 'value_source' ? 'foreign_value'
-        : kind
+    kind === 'enum_id' || kind === 'enum_value' ? 'enum'
+      : kind === 'index_source' ? 'fk'
+        : kind === 'value_source' ? 'foreign_value'
+          : kind
   );
 
   return {
     kind: componentKind,
-    baseType: inferredType.baseType,
-    ...(inferredType.baseTypes ? { baseTypes: inferredType.baseTypes } : {}),
+    baseType: kind === 'enum_id' ? 'integer' : inferredType.baseType,
+    ...(kind !== 'enum_id' && inferredType.baseTypes ? { baseTypes: inferredType.baseTypes } : {}),
     values: componentKind === 'enum'
       ? values.sort((a, b) => String(a).localeCompare(String(b)))
       : [],
@@ -240,36 +341,18 @@ function inferBaseType(
   return { baseType: 'mixed', baseTypes };
 }
 
-function suggestFieldId(keyName: string, kind: FieldKind): string {
-  if (kind === 'enum') {
-    return keyName;
-  }
-
-  const bySuffix = (suffix: string): string | null => {
-    if (!keyName.endsWith(suffix) || keyName.length <= suffix.length) return null;
-    return keyName.slice(0, -suffix.length);
-  };
-
-  const idPrefix = bySuffix('Id');
-  if (idPrefix) return `${idPrefix}.Id`;
-
-  const titlePrefix = bySuffix('Title');
-  if (titlePrefix) return `${titlePrefix}.Title`;
-
-  const namePrefix = bySuffix('Name');
-  if (namePrefix) return `${namePrefix}.Name`;
-
-  return keyName.includes('.') ? keyName : `${keyName}.${keyName}`;
-}
-
 function suggestedFieldIdForKind(
   kind: FieldKind,
   suggestion?: SuggestionAdvice,
 ): string | undefined {
   if (!suggestion) return undefined;
-  if (suggestion.reuseComponentId && kind === 'enum') return suggestion.reuseComponentId;
+  if (suggestion.reuseComponentId && (kind === 'enum_id' || kind === 'enum_value')) {
+    return suggestion.reuseComponentId;
+  }
   if (suggestion.targetFieldId) return suggestion.targetFieldId;
-  if (suggestion.newComponentName && kind === 'enum') return suggestion.newComponentName;
+  if (suggestion.newComponentName && (kind === 'enum_id' || kind === 'enum_value')) {
+    return suggestion.newComponentName;
+  }
   return undefined;
 }
 
@@ -281,18 +364,22 @@ function suggestedTargetLabel(suggestion: SuggestionAdvice): string | undefined 
 
 function canAcceptSuggestion(
   suggestion: SuggestionAdvice | undefined,
-  components: SharedComponents,
 ): boolean {
   if (!suggestion) return false;
   if (suggestion.kind === 'scalar') return true;
 
-  if (suggestion.kind === 'enum') {
-    const reuse = nonEmpty(suggestion.reuseComponentId);
-    if (reuse && components[reuse]) return true;
-    return !!(nonEmpty(suggestion.newComponentName) || nonEmpty(suggestion.targetFieldId));
+  const candidateId = nonEmpty(suggestion.reuseComponentId)
+    ?? nonEmpty(suggestion.targetFieldId)
+    ?? nonEmpty(suggestion.newComponentName);
+  if (!candidateId) return false;
+  if (suggestion.kind === 'enum_id' || suggestion.kind === 'enum_value') {
+    return candidateId.trim().length > 0;
   }
-
-  return !!nonEmpty(suggestion.targetFieldId);
+  const parsed = parseModelFieldId(candidateId);
+  if (!parsed) return false;
+  if (suggestion.kind === 'index_source' || suggestion.kind === 'value_source') return true;
+  // fk/foreign_value may legitimately reference undefined model fields.
+  return parsed.modelName.length > 0 && parsed.fieldName.length > 0;
 }
 
 function applyAcceptedSuggestion(
@@ -309,33 +396,34 @@ function applyAcceptedSuggestion(
 
   const valuesArr = Array.from(values);
   const inferredType = inferBaseType(values);
+  const candidateId = nonEmpty(suggestion.reuseComponentId)
+    ?? nonEmpty(suggestion.targetFieldId)
+    ?? nonEmpty(suggestion.newComponentName);
+  if (!candidateId) return undefined;
 
-  if (suggestion.kind === 'enum') {
-    const reuse = nonEmpty(suggestion.reuseComponentId);
-    if (reuse && components[reuse]) {
-      return { action: 'apply', kind: 'enum', matchesExisting: reuse };
+  if (suggestion.kind === 'enum_id' || suggestion.kind === 'enum_value') {
+    const enumName = candidateId.trim();
+    if (!enumName) return undefined;
+    const componentId = enumComponentId(enumName, suggestion.kind === 'enum_id' ? 'id' : 'value');
+    if (!components[componentId]) {
+      const component = componentForKind(suggestion.kind, inferredType, valuesArr, keyName);
+      if (component) addComponent(components, componentId, component);
     }
-
-    const newId = nonEmpty(suggestion.newComponentName) ?? nonEmpty(suggestion.targetFieldId);
-    if (!newId) return undefined;
-
-    if (!components[newId]) {
-      const component = componentForKind('enum', inferredType, valuesArr, keyName);
-      if (component) addComponent(components, newId, component);
-    }
-
-    return { action: 'apply', kind: 'enum', componentId: newId };
+    return { action: 'apply', kind: suggestion.kind, componentId, enumName };
   }
 
-  const fieldId = nonEmpty(suggestion.targetFieldId);
-  if (!fieldId) return undefined;
+  const parsed = parseModelFieldId(candidateId);
+  if (!parsed) return undefined;
 
-  if (!components[fieldId]) {
+  if (
+    (suggestion.kind === 'index_source' || suggestion.kind === 'value_source')
+    && !components[candidateId]
+  ) {
     const component = componentForKind(suggestion.kind, inferredType, valuesArr, keyName);
-    if (component) addComponent(components, fieldId, component);
+    if (component) addComponent(components, candidateId, component);
   }
 
-  return { action: 'apply', kind: suggestion.kind, componentId: fieldId };
+  return { action: 'apply', kind: suggestion.kind, componentId: candidateId };
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -344,10 +432,149 @@ function nonEmpty(value: string | undefined): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+async function promptForModelField(
+  kind: FieldKind,
+  components: SharedComponents,
+  keyName: string,
+  suggestion?: SuggestionAdvice,
+): Promise<ModelFieldRef> {
+  const known = knownModels(components);
+  const suggestedFieldId = suggestedFieldIdForKind(kind, suggestion);
+  const suggested = parseModelFieldId(suggestedFieldId);
+
+  const defaultModelName = suggested?.modelName ?? suggestModelName(keyName);
+  const modelName = await promptModelName(known, defaultModelName);
+
+  const defaultFieldName = suggested?.fieldName ?? suggestSimpleFieldName(keyName);
+  const existingFields = known.get(modelName) ?? [];
+  const fieldName = await promptFieldName(existingFields, defaultFieldName, modelName);
+
+  return { modelName, fieldName };
+}
+
+async function promptEnumName(
+  enums: EnumRegistry,
+  defaultEnumName: string,
+): Promise<string> {
+  const enumNames = Object.keys(enums).sort((a, b) => a.localeCompare(b));
+  if (enumNames.length === 0) {
+    const raw = await tracedInput('enum.name', { message: 'Enum name:', default: defaultEnumName });
+    return requireText(raw, defaultEnumName);
+  }
+
+  const enumChoice = await tracedSelect<string>('enum.select', {
+    message: 'Select enum:',
+    choices: [
+      ...enumNames.map((name) => ({ value: name, name })),
+      { value: '__new__', name: 'Create new enum' },
+    ],
+  });
+
+  if (enumChoice !== '__new__') return enumChoice;
+  const raw = await tracedInput('enum.new', { message: 'New enum name:', default: defaultEnumName });
+  return requireText(raw, defaultEnumName);
+}
+
+function knownModels(components: SharedComponents): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  for (const id of Object.keys(components)) {
+    const parsed = parseModelFieldId(id);
+    if (!parsed) continue;
+    const existing = map.get(parsed.modelName) ?? [];
+    if (!existing.includes(parsed.fieldName)) existing.push(parsed.fieldName);
+    map.set(parsed.modelName, existing);
+  }
+  for (const [modelName, fields] of map.entries()) {
+    fields.sort((a, b) => a.localeCompare(b));
+    map.set(modelName, fields);
+  }
+  return map;
+}
+
+async function promptModelName(
+  known: Map<string, string[]>,
+  defaultModelName: string,
+): Promise<string> {
+  const modelNames = Array.from(known.keys()).sort((a, b) => a.localeCompare(b));
+  if (modelNames.length === 0) {
+    const raw = await tracedInput('model.name', { message: 'Model name:', default: defaultModelName });
+    return requireText(raw, defaultModelName);
+  }
+
+  const modelChoice = await tracedSelect<string>('model.select', {
+    message: 'Select model:',
+    choices: [
+      ...modelNames.map((name) => ({ value: name, name })),
+      { value: '__new__', name: 'Create new model' },
+    ],
+  });
+
+  if (modelChoice !== '__new__') return modelChoice;
+  const raw = await tracedInput('model.new', { message: 'New model name:', default: defaultModelName });
+  return requireText(raw, defaultModelName);
+}
+
+async function promptFieldName(
+  existingFields: string[],
+  defaultFieldName: string,
+  modelName: string,
+): Promise<string> {
+  if (existingFields.length === 0) {
+    const raw = await tracedInput('field.name', { message: `Field name for ${modelName}:`, default: defaultFieldName });
+    return requireText(raw, defaultFieldName);
+  }
+
+  const fieldChoice = await tracedSelect<string>('field.select', {
+    message: `Select field for ${modelName}:`,
+    choices: [
+      ...existingFields.map((name) => ({ value: name, name })),
+      { value: '__new__', name: 'Create new field' },
+    ],
+  });
+
+  if (fieldChoice !== '__new__') return fieldChoice;
+  const raw = await tracedInput('field.new', { message: `New field name for ${modelName}:`, default: defaultFieldName });
+  return requireText(raw, defaultFieldName);
+}
+
+function parseModelFieldId(value: string | undefined): ModelFieldRef | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  const lastDot = trimmed.lastIndexOf('.');
+  if (lastDot <= 0 || lastDot >= trimmed.length - 1) return null;
+  const modelName = trimmed.slice(0, lastDot).trim();
+  const fieldName = trimmed.slice(lastDot + 1).trim();
+  if (!modelName || !fieldName) return null;
+  return { modelName, fieldName };
+}
+
+function suggestModelName(keyName: string): string {
+  const parsed = suggestSimpleFieldName(keyName);
+  if (parsed === keyName) return keyName;
+  return parsed;
+}
+
+function suggestSimpleFieldName(keyName: string): string {
+  const bySuffix = (suffix: string): string | null => {
+    if (!keyName.endsWith(suffix) || keyName.length <= suffix.length) return null;
+    return keyName.slice(0, -suffix.length);
+  };
+  return bySuffix('Id')
+    ?? bySuffix('Title')
+    ?? bySuffix('Name')
+    ?? keyName;
+}
+
+function requireText(value: string, fallback: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length > 0) return trimmed;
+  return fallback;
+}
+
 // ── Batch review (edit decisions JSON) ──────────────────────────────
 
 export async function promptBatchOrInteractive(): Promise<'interactive' | 'batch'> {
-  return select({
+  return tracedSelect('review.mode', {
     message: 'How would you like to review suspects?',
     choices: [
       { value: 'interactive' as const, name: 'Interactive (one at a time)' },
@@ -361,7 +588,7 @@ export async function promptBatchOrInteractive(): Promise<'interactive' | 'batch
 export type ValidationAction = 'undo' | 'edit' | 'report' | 'retry' | 'force';
 
 export async function promptValidationFailure(): Promise<ValidationAction> {
-  return select({
+  return tracedSelect('validation.failure', {
     message: 'Validation failed. What would you like to do?',
     choices: [
       { value: 'undo' as const, name: 'Undo last decision' },
@@ -388,13 +615,13 @@ export async function promptMainMenu(hasSessions: boolean): Promise<MainAction> 
 
   choices.push({ value: 'exit', name: 'Exit' });
 
-  return select({ message: 'What would you like to do?', choices });
+  return tracedSelect('main.menu', { message: 'What would you like to do?', choices });
 }
 
 export async function promptSelectSession(
   sessions: { name: string; step: string }[],
 ): Promise<string> {
-  return select({
+  return tracedSelect('session.select', {
     message: 'Select a session to resume:',
     choices: sessions.map((s) => ({
       value: s.name,
@@ -404,5 +631,5 @@ export async function promptSelectSession(
 }
 
 export async function promptContinue(message: string): Promise<boolean> {
-  return confirm({ message, default: true });
+  return tracedConfirm('continue.confirm', { message, default: true });
 }

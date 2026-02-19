@@ -2,7 +2,7 @@
  * Schema Transform: apply user decisions to quicktype-inferred schemas.
  *
  * For each property in each method schema, apply scoped user decisions:
- * - enum/fk/foreign_value => reference shared component + x-relationship metadata
+ * - enum_id/enum_value/fk/foreign_value => reference shared component + metadata
  * - index_source/value_source => keep inline schema + source metadata
  */
 
@@ -87,7 +87,12 @@ function transformSchema(
 
           if (
             fieldId &&
-            (decision.kind === 'enum' || decision.kind === 'fk' || decision.kind === 'foreign_value') &&
+            (
+              decision.kind === 'enum_id'
+              || decision.kind === 'enum_value'
+              || decision.kind === 'fk'
+              || decision.kind === 'foreign_value'
+            ) &&
             fieldId in components
           ) {
             const ref: JsonSchema = { $ref: `#/components/schemas/${fieldId}` };
@@ -101,18 +106,36 @@ function transformSchema(
               result.properties[propName] = {
                 anyOf: [ref, { type: 'null' as const }],
                 nullable: true,
-                'x-relationship': {
-                  role: decision.kind,
-                  field: fieldId,
-                },
+                ...(decision.kind === 'enum_id' || decision.kind === 'enum_value'
+                  ? {
+                    'x-enum': {
+                      role: decision.kind,
+                      name: decision.enumName ?? fieldId,
+                    },
+                  }
+                  : {
+                    'x-relationship': {
+                      role: decision.kind,
+                      field: fieldId,
+                    },
+                  }),
               };
             } else {
               result.properties[propName] = {
                 ...ref,
-                'x-relationship': {
-                  role: decision.kind,
-                  field: fieldId,
-                },
+                ...(decision.kind === 'enum_id' || decision.kind === 'enum_value'
+                  ? {
+                    'x-enum': {
+                      role: decision.kind,
+                      name: decision.enumName ?? fieldId,
+                    },
+                  }
+                  : {
+                    'x-relationship': {
+                      role: decision.kind,
+                      field: fieldId,
+                    },
+                  }),
               };
             }
             continue;
@@ -265,6 +288,53 @@ export function buildComponentSchemas(
   }
 
   return schemas;
+}
+
+/**
+ * Build object schemas for domain models by grouping shared field components
+ * using "<Model>.<Field>" naming.
+ */
+export function buildModelSchemas(
+  components: SharedComponents,
+): Record<string, JsonSchema> {
+  const fieldSchemas = buildComponentSchemas(components);
+  const grouped = new Map<string, string[]>();
+
+  for (const fieldId of Object.keys(fieldSchemas)) {
+    const parsed = parseModelFieldId(fieldId);
+    if (!parsed) continue;
+    const existing = grouped.get(parsed.modelName) ?? [];
+    existing.push(parsed.fieldName);
+    grouped.set(parsed.modelName, existing);
+  }
+
+  const out: Record<string, JsonSchema> = {};
+  for (const [modelName, fields] of grouped.entries()) {
+    const properties: Record<string, JsonSchema> = {};
+    for (const fieldName of fields.sort((a, b) => a.localeCompare(b))) {
+      const fieldId = `${modelName}.${fieldName}`;
+      const fieldSchema = fieldSchemas[fieldId];
+      if (!fieldSchema) continue;
+      properties[fieldName] = fieldSchema;
+    }
+
+    out[modelName] = {
+      type: 'object',
+      properties,
+      description: `Model: ${modelName}`,
+    };
+  }
+
+  return out;
+}
+
+function parseModelFieldId(value: string): { modelName: string; fieldName: string } | null {
+  const lastDot = value.lastIndexOf('.');
+  if (lastDot <= 0 || lastDot >= value.length - 1) return null;
+  const modelName = value.slice(0, lastDot).trim();
+  const fieldName = value.slice(lastDot + 1).trim();
+  if (!modelName || !fieldName) return null;
+  return { modelName, fieldName };
 }
 
 function resolveComponentTypes(component: {

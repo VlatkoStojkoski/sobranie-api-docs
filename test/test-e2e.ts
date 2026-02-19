@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { extractFromHar } from '../src/extract.js';
 import { inferSchemas } from '../src/infer.js';
 import { buildValueRegistry, detectSuspects } from '../src/value-registry.js';
-import { setFieldDecision, addComponent } from '../src/decisions.js';
+import { setFieldDecision, addComponent, enumComponentId } from '../src/decisions.js';
 import { transformSchemas } from '../src/schema-transform.js';
 import { validateSchemas } from '../src/validate.js';
 import { emitOpenApi } from '../src/emit.js';
@@ -28,7 +28,7 @@ async function main(): Promise<void> {
     const suspects = detectSuspects(registry);
     assert.ok(suspects.length > 0);
 
-    const decisions: Decisions = { fields: {} };
+    const decisions: Decisions = { fields: {}, enums: {} };
     const components: SharedComponents = {};
 
     const legislationResponseStatus = suspects.find(
@@ -45,19 +45,29 @@ async function main(): Promise<void> {
       .sort((a, b) => a.localeCompare(b))
       .filter((v, i, arr) => (i === 0 ? true : v !== arr[i - 1]));
 
-    addComponent(components, 'StatusEnum', {
+    const statusEnumComponent = enumComponentId('Status', 'value');
+    addComponent(components, statusEnumComponent, {
       kind: 'enum',
       baseType: 'string',
       values: statusValues,
     });
+    decisions.enums.Status = { ids: [], values: statusValues };
     // Two scoped fields can intentionally share a single component.
-    setFieldDecision(decisions, legislationResponseStatus.decisionKey, { kind: 'enum', componentId: 'StatusEnum' });
-    setFieldDecision(decisions, sessionsResponseStatus.decisionKey, { kind: 'enum', componentId: 'StatusEnum' });
+    setFieldDecision(decisions, legislationResponseStatus.decisionKey, {
+      kind: 'enum_value',
+      enumName: 'Status',
+      componentId: statusEnumComponent,
+    });
+    setFieldDecision(decisions, sessionsResponseStatus.decisionKey, {
+      kind: 'enum_value',
+      enumName: 'Status',
+      componentId: statusEnumComponent,
+    });
 
     const transformed = transformSchemas(schemas, decisions, components);
     const transformedJson = JSON.stringify(transformed);
     assert.ok(
-      transformedJson.includes('#/components/schemas/StatusEnum'),
+      transformedJson.includes(`#/components/schemas/${statusEnumComponent}`),
       'transformed schemas should include shared enum refs',
     );
 
@@ -75,11 +85,11 @@ async function main(): Promise<void> {
     assert.equal(paths.length, schemas.length);
 
     const shared = await readdir(join(outDir, 'schemas', 'shared'));
-    assert.deepEqual(shared, ['StatusEnum.yaml']);
+    assert.deepEqual(shared, [`${statusEnumComponent}.yaml`]);
 
     const bundled = JSON.parse(await readFile(join(outDir, 'openapi.bundled.json'), 'utf-8')) as Record<string, any>;
     assert.equal(Object.keys(bundled.paths).length, schemas.length);
-    assert.ok(bundled.components.schemas.StatusEnum.enum.length > 0);
+    assert.ok(bundled.components.schemas[statusEnumComponent].enum.length > 0);
 
     console.log('PASS test-e2e.ts');
   } finally {

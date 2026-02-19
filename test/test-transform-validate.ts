@@ -3,6 +3,7 @@ import { transformSchemas, buildComponentSchemas } from '../src/schema-transform
 import { validateSchemas } from '../src/validate.js';
 import { makeScopedFieldKey } from '../src/scoped-field.js';
 import type { Decisions, MethodCorpus, MethodSchema, SharedComponents, JsonSchema } from '../src/types.js';
+import { enumComponentId } from '../src/decisions.js';
 
 async function main(): Promise<void> {
   const schemas: MethodSchema[] = [
@@ -51,7 +52,11 @@ async function main(): Promise<void> {
 
   const decisions: Decisions = {
     fields: {
-      [makeScopedFieldKey('GetItems', 'request', '$', 'Status')]: { kind: 'enum', componentId: 'StatusEnum' },
+      [makeScopedFieldKey('GetItems', 'request', '$', 'Status')]: {
+        kind: 'enum_value',
+        enumName: 'Status',
+        componentId: enumComponentId('Status', 'value'),
+      },
       [makeScopedFieldKey('GetItems', 'response', '$', 'NullableId')]: { kind: 'fk', componentId: 'Committee.Id' },
       [makeScopedFieldKey('GetItems', 'response', '$', 'TypeTitle')]: {
         kind: 'foreign_value',
@@ -65,12 +70,16 @@ async function main(): Promise<void> {
         kind: 'value_source',
         componentId: 'Committee.Title',
       },
-      MissingComponent: { kind: 'enum', componentId: 'UnknownEnum' },
+      MissingComponent: { kind: 'enum_value', enumName: 'Unknown', componentId: enumComponentId('Unknown', 'value') },
+    },
+    enums: {
+      Status: { ids: [1, 2], values: ['active', 'draft'] },
+      Unknown: { ids: [], values: [] },
     },
   };
 
   const components: SharedComponents = {
-    StatusEnum: {
+    [enumComponentId('Status', 'value')]: {
       kind: 'enum',
       baseType: 'string',
       values: ['active', 'draft'],
@@ -109,7 +118,7 @@ async function main(): Promise<void> {
   const transformedResponse = transformed[0]!.responseSchema;
 
   const topLevelStatus = transformedRequest.properties?.Status as JsonSchema | undefined;
-  assert.equal(topLevelStatus?.$ref, '#/components/schemas/StatusEnum');
+  assert.equal(topLevelStatus?.$ref, `#/components/schemas/${enumComponentId('Status', 'value')}`);
 
   const nestedStatus = (transformedRequest.properties?.Nested as JsonSchema | undefined)
     ?.properties?.Status as JsonSchema | undefined;
@@ -227,7 +236,7 @@ async function main(): Promise<void> {
   assert.equal(missingSchema.failureRecords[0]!.requestErrors[0], 'No schema found');
 
   const componentSchemas = buildComponentSchemas(components);
-  assert.deepEqual(componentSchemas.StatusEnum?.enum, ['active', 'draft']);
+  assert.deepEqual(componentSchemas[enumComponentId('Status', 'value')]?.enum, ['active', 'draft']);
   assert.equal(componentSchemas['Committee.Id']?.type, 'integer');
   assert.equal(componentSchemas['Committee.Id']?.enum, undefined);
   assert.deepEqual(

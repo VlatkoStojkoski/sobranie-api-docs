@@ -22,6 +22,9 @@ import {
   samplesDir,
   decisionsPath,
   suggestionsPath,
+  promptLogPath,
+  llmLogPath,
+  pipelineLogPath,
   openApiDir,
 } from './session.js';
 import {
@@ -38,6 +41,8 @@ import {
   promptForSuspect,
   promptBatchOrInteractive,
   promptValidationFailure,
+  setPromptTraceLogger,
+  setPromptReloadHandler,
 } from './prompts.js';
 
 import { extractFromHar } from '../extract.js';
@@ -62,6 +67,7 @@ import {
   applyUsageToMetrics,
 } from '../llm/state.js';
 import { createSuggestionClient } from '../llm/suggest.js';
+import { appendJsonLine, timestampedEvent } from '../logging.js';
 
 import type {
   MethodCorpus,
@@ -138,6 +144,125 @@ function suggestionTarget(advice: SuggestionAdvice): string | undefined {
   return advice.reuseComponentId ?? advice.targetFieldId ?? advice.newComponentName;
 }
 
+function parseModelFieldId(value: string | undefined): { modelName: string; fieldName: string } | null {
+  if (!value) return null;
+  const lastDot = value.lastIndexOf('.');
+  if (lastDot <= 0 || lastDot >= value.length - 1) return null;
+  const modelName = value.slice(0, lastDot).trim();
+  const fieldName = value.slice(lastDot + 1).trim();
+  if (!modelName || !fieldName) return null;
+  return { modelName, fieldName };
+}
+
+function inferPrimitiveTypes(values: Set<string | number | boolean>): string[] {
+  let hasString = false;
+  let hasNumber = false;
+  let hasInteger = true;
+  let hasBoolean = false;
+  for (const value of values) {
+    if (typeof value === 'string') hasString = true;
+    if (typeof value === 'boolean') hasBoolean = true;
+    if (typeof value === 'number') {
+      hasNumber = true;
+      if (!Number.isInteger(value)) hasInteger = false;
+    }
+  }
+  const out: string[] = [];
+  if (hasString) out.push('string');
+  if (hasNumber) out.push(hasInteger ? 'integer' : 'number');
+  if (hasBoolean) out.push('boolean');
+  return out;
+}
+
+function componentTypes(component: { baseType: string; baseTypes?: string[] }): string[] {
+  if (component.baseTypes && component.baseTypes.length > 0) {
+    return Array.from(new Set(component.baseTypes));
+  }
+  if (component.baseType && component.baseType !== 'mixed') return [component.baseType];
+  return [];
+}
+
+function hasTypeConflict(
+  existing: { baseType: string; baseTypes?: string[] },
+  inferred: string[],
+): boolean {
+  const existingSet = new Set(componentTypes(existing));
+  const inferredSet = new Set(inferred);
+  if (existingSet.size === 0 || inferredSet.size === 0) return false;
+  if (existingSet.size !== inferredSet.size) return true;
+  for (const t of existingSet) {
+    if (!inferredSet.has(t)) return true;
+  }
+  return false;
+}
+
+function expectedComponentKindForDecision(
+  decisionKind: FieldDecision['kind'],
+): 'enum' | 'fk' | 'foreign_value' | null {
+  if (decisionKind === 'enum_id' || decisionKind === 'enum_value') return 'enum';
+  if (decisionKind === 'fk' || decisionKind === 'index_source') return 'fk';
+  if (decisionKind === 'foreign_value' || decisionKind === 'value_source') return 'foreign_value';
+  return null;
+}
+
+function ensureEnumDefinition(decisions: Decisions, enumName: string): {
+  ids: number[];
+  values: (string | number | boolean)[];
+  members?: Array<{ id: number; value: string | number | boolean }>;
+  description?: string;
+} {
+  const existing = decisions.enums[enumName];
+  if (existing) return existing;
+  const created = { ids: [], values: [] } as {
+    ids: number[];
+    values: (string | number | boolean)[];
+    members?: Array<{ id: number; value: string | number | boolean }>;
+    description?: string;
+  };
+  decisions.enums[enumName] = created;
+  return created;
+}
+
+function observedEnumIds(values: Set<string | number | boolean>): { ids: number[]; invalid: unknown[] } {
+  const ids: number[] = [];
+  const invalid: unknown[] = [];
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isInteger(value)) {
+      ids.push(value);
+    } else {
+      invalid.push(value);
+    }
+  }
+  return { ids: Array.from(new Set(ids)).sort((a, b) => a - b), invalid };
+}
+
+function observedEnumValues(values: Set<string | number | boolean>): (string | number | boolean)[] {
+  return Array.from(new Set(values));
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => stableStringify(v)).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort((a, b) => a.localeCompare(b));
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(record[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function decisionsFingerprint(
+  decisions: Decisions,
+  components: SharedComponents,
+): string {
+  return stableStringify({
+    fields: decisions.fields,
+    enums: decisions.enums,
+    components,
+  });
+}
+
 // ── Pipeline runner ─────────────────────────────────────────────────
 
 async function runSession(
@@ -152,22 +277,91 @@ async function runSession(
   },
 ): Promise<void> {
   let progress = await loadProgress(sessionDir);
+  let decisions: Decisions = { fields: {}, enums: {} };
+  let components: SharedComponents = {};
+  let decisionsLoaded = false;
+  const pipelineLog = pipelineLogPath(sessionDir);
+  const promptsLog = promptLogPath(sessionDir);
+  const llmLog = llmLogPath(sessionDir);
+
+  const logPipeline = async (
+    event: string,
+    payload: Record<string, unknown> = {},
+  ): Promise<void> => {
+    await appendJsonLine(pipelineLog, timestampedEvent(event, payload));
+  };
+
+  const logLlm = async (
+    event: string,
+    payload: Record<string, unknown> = {},
+  ): Promise<void> => {
+    await appendJsonLine(llmLog, timestampedEvent(event, payload));
+  };
+
+  setPromptTraceLogger(async (event) => {
+    await appendJsonLine(promptsLog, {
+      timestamp: event.timestamp,
+      promptType: event.promptType,
+      context: event.context,
+      message: event.message,
+      response: event.response,
+      choices: event.choices,
+    });
+  });
+  const stopPromptTracing = (): void => {
+    setPromptTraceLogger(null);
+  };
+
+  const reloadDecisionsFromDisk = async (reason: string): Promise<void> => {
+    if (!decisionsLoaded) {
+      await logPipeline('decisions.reload.skip', { reason, because: 'not_loaded_yet' });
+      return;
+    }
+    const reloaded = await loadDecisions(decisionsPath(sessionDir));
+    decisions = reloaded.decisions;
+    components = reloaded.components;
+    await logPipeline('decisions.reload', {
+      reason,
+      decided: Object.keys(decisions.fields).length,
+      components: Object.keys(components).length,
+    });
+    console.log('\n  Reloaded decisions.json. Restarting current prompt.\n');
+  };
+
+  setPromptReloadHandler(async () => {
+    await reloadDecisionsFromDisk('ctrl+r');
+  });
+
+  await logPipeline('session.start', {
+    sessionDir,
+    step: progress.step,
+    options,
+  });
 
   console.log(`\nSession: ${sessionDir}`);
   console.log(`Current step: ${progress.step}\n`);
+  await logPipeline('session.state', { step: progress.step });
 
   // ── Step 1: Recording ──
   if (progress.step === 'recording') {
+    await logPipeline('step.recording.start');
     await runRecording(sessionDir);
     progress = await updateStep(sessionDir, 'extracted');
+    await logPipeline('step.recording.done', { nextStep: progress.step });
   }
 
   // ── Step 2: Extract + Normalize ──
   let corpora: MethodCorpus[] = [];
   if (progress.step === 'extracted' || needsExtraction(progress.step)) {
+    await logPipeline('step.extract.start');
     corpora = await runExtract(sessionDir);
+    await logPipeline('step.extract.done', {
+      methods: corpora.length,
+      samples: corpora.reduce((s, c) => s + c.samples.length, 0),
+    });
     if (progress.step === 'extracted') {
       progress = await updateStep(sessionDir, 'inferred');
+      await logPipeline('step.transition', { nextStep: progress.step });
     }
   } else {
     corpora = await runExtract(sessionDir);
@@ -176,9 +370,12 @@ async function runSession(
   // ── Step 3: Infer ──
   let schemas: MethodSchema[] = [];
   if (progress.step === 'inferred' || needsInference(progress.step)) {
+    await logPipeline('step.infer.start');
     schemas = await runInfer(corpora);
+    await logPipeline('step.infer.done', { methods: schemas.length });
     if (progress.step === 'inferred') {
       progress = await updateStep(sessionDir, 'collecting_values');
+      await logPipeline('step.transition', { nextStep: progress.step });
     }
   }
 
@@ -188,11 +385,18 @@ async function runSession(
     const registry = buildValueRegistry(corpora);
     suspects = detectSuspects(registry);
     console.log(`\n  ${suspects.length} suspect fields detected\n`);
+    await logPipeline('step.collect_values.done', { suspects: suspects.length });
     progress = await updateStep(sessionDir, 'prompting');
+    await logPipeline('step.transition', { nextStep: progress.step });
   }
 
   // ── Step 5: Prompt User ──
-  let { decisions, components } = await loadDecisions(decisionsPath(sessionDir));
+  {
+    const loaded = await loadDecisions(decisionsPath(sessionDir));
+    decisions = loaded.decisions;
+    components = loaded.components;
+    decisionsLoaded = true;
+  }
 
   if (progress.step === 'prompting') {
     if (suspects.length === 0) {
@@ -205,8 +409,10 @@ async function runSession(
 
     if (undecided.length > 0) {
       const mode = options.reviewMode ?? await promptBatchOrInteractive();
+      await logPipeline('prompting.mode', { mode, undecided: undecided.length });
 
       if (mode === 'interactive') {
+        console.log('  Tip: Press Ctrl+R at any prompt to reload decisions.json and restart that prompt.\n');
         let suggestionState: SuggestionsState | null = null;
         let suggestionClient: ReturnType<typeof createSuggestionClient> | null = null;
         const pendingSuggestions = new Map<string, Promise<SuggestionFetchResult>>();
@@ -249,6 +455,11 @@ async function runSession(
           if (cached) {
             suggestionState.metrics.cacheHits++;
             await persistSuggestionState();
+            await logLlm('suggestion.cache_hit', {
+              decisionKey: suspect.decisionKey,
+              kind: cached.advice.kind,
+              confidence: cached.advice.confidence,
+            });
             return { advice: cached.advice };
           }
 
@@ -256,6 +467,13 @@ async function runSession(
           if (pending) return pending;
 
           suggestionState.metrics.attemptedCalls++;
+          await logLlm('suggestion.request', {
+            decisionKey: suspect.decisionKey,
+            methodName: suspect.methodName,
+            direction: suspect.direction,
+            parentPath: suspect.parentPath,
+            keyName: suspect.keyName,
+          });
           const promise = (async (): Promise<SuggestionFetchResult> => {
             const result = await suggestionClient!.suggest({
               suspect,
@@ -274,8 +492,25 @@ async function runSession(
               suggestionState!.suggestions[suspect.decisionKey] = entry;
               suggestionState!.metrics.completedCalls++;
               applyUsageToMetrics(suggestionState!.metrics, result.usage, suggestionPricing);
+              await logLlm('suggestion.response', {
+                decisionKey: suspect.decisionKey,
+                prompt: result.prompt,
+                response: result.rawResponse ?? result.advice,
+                advice: result.advice,
+                usage: result.usage,
+                latencyMs: result.latencyMs,
+                runningMetrics: suggestionState!.metrics,
+              });
             } else {
               suggestionState!.metrics.failedCalls++;
+              await logLlm('suggestion.error', {
+                decisionKey: suspect.decisionKey,
+                prompt: result.prompt,
+                error: result.error,
+                latencyMs: result.latencyMs,
+                usage: result.usage,
+                runningMetrics: suggestionState!.metrics,
+              });
             }
 
             await persistSuggestionState();
@@ -298,9 +533,29 @@ async function runSession(
         };
 
         let i = startIndex;
-        prefetchSuggestion(undecided[i]);
-        while (i < undecided.length) {
-          const suspect = undecided[i]!;
+        let decisionsFileHash = decisionsFingerprint(decisions, components);
+        {
+          const initialUndecided = suspects.filter((s) => !(s.decisionKey in decisions.fields));
+          prefetchSuggestion(initialUndecided[i]);
+        }
+        while (true) {
+          const latestFile = await loadDecisions(decisionsPath(sessionDir));
+          const latestHash = decisionsFingerprint(latestFile.decisions, latestFile.components);
+          if (latestHash !== decisionsFileHash) {
+            decisions = latestFile.decisions;
+            components = latestFile.components;
+            decisionsFileHash = latestHash;
+            console.log('  decisions.json changed on disk. Reloaded and restarting current field.\n');
+            await logPipeline('decisions.reload_from_disk', {
+              promptIndex: i,
+              decided: Object.keys(decisions.fields).length,
+              components: Object.keys(components).length,
+            });
+          }
+
+          const undecidedNow = suspects.filter((s) => !(s.decisionKey in decisions.fields));
+          if (i >= undecidedNow.length) break;
+          const suspect = undecidedNow[i]!;
           const fetchedSuggestion = await fetchSuggestion(suspect);
           const shownSuggestion = fetchedSuggestion.advice &&
             fetchedSuggestion.advice.confidence >= options.suggestionsConfidenceThreshold
@@ -311,12 +566,13 @@ async function runSession(
             await persistSuggestionState();
           }
 
-          prefetchSuggestion(undecided[i + 1]);
+          prefetchSuggestion(undecidedNow[i + 1]);
 
           const promptStartedAt = Date.now();
           const result = await promptForSuspect(
             suspect,
             components,
+            decisions.enums,
             i,
             undecided.length,
             shownSuggestion,
@@ -353,7 +609,7 @@ async function runSession(
             }
 
             const previousIndex = i - 1;
-            const previousSuspect = undecided[previousIndex]!;
+            const previousSuspect = undecidedNow[previousIndex]!;
             const previousKey = previousSuspect.decisionKey;
             const previousDecision = decisions.fields[previousKey];
 
@@ -379,6 +635,11 @@ async function runSession(
             progress.nextPromptIndex = previousIndex;
             await saveProgress(sessionDir, progress);
             await saveDecisions(decisionsPath(sessionDir), decisions, components);
+            decisionsFileHash = decisionsFingerprint(decisions, components);
+            await logPipeline('decision.undo', {
+              decisionKey: previousKey,
+              promptIndex: previousIndex,
+            });
 
             console.log(
               `  Undid previous decision. Returning to ${previousSuspect.methodName} [${previousSuspect.direction}] ${previousSuspect.keyName}.\n`,
@@ -388,16 +649,184 @@ async function runSession(
             continue;
           }
 
+          const selectedFieldId = result.matchesExisting ?? result.componentId;
+          const isEnumKind = result.kind === 'enum_id' || result.kind === 'enum_value';
+          const modelRef = isEnumKind ? null : parseModelFieldId(selectedFieldId);
+          if (result.kind !== 'scalar' && !isEnumKind && !modelRef) {
+            console.log('  Selected relationship target is not in "Model.Field" format. Restarting this field.\n');
+            continue;
+          }
+
+          if (result.kind === 'enum_id') {
+            const { ids, invalid } = observedEnumIds(suspect.entry.values);
+            if (invalid.length > 0) {
+              console.error(
+                `\nEnum ID fields must be integers. Found non-integer values: ${invalid.slice(0, 10).map(String).join(', ')}`
+                + `${invalid.length > 10 ? ` ... (+${invalid.length - 10} more)` : ''}.`,
+              );
+              const ready = await promptContinue('Edit decisions.json if needed, then restart this prompt?');
+              if (!ready) {
+                console.log('  Session saved. Resume later to continue.\n');
+                await logPipeline('session.pause', { reason: 'enum_id_non_integer' });
+                stopPromptTracing();
+                setPromptReloadHandler(null);
+                return;
+              }
+              continue;
+            }
+            if (result.enumName) {
+              const def = ensureEnumDefinition(decisions, result.enumName);
+              const existing = new Set(def.ids);
+              const drift = ids.filter((id) => !existing.has(id));
+              if (drift.length > 0 && def.ids.length > 0) {
+                console.warn(
+                  `\nEnum id drift detected for ${result.enumName}: ${drift.slice(0, 10).join(', ')}`
+                  + `${drift.length > 10 ? ` ... (+${drift.length - 10} more)` : ''}.`,
+                );
+                const shouldMerge = await promptContinue('Merge these enum ids?');
+                if (!shouldMerge) {
+                  const ready = await promptContinue('Edit decisions.json to resolve enum id drift, then continue?');
+                  if (!ready) {
+                    console.log('  Session saved. Resume later to continue.\n');
+                    await logPipeline('session.pause', { reason: 'enum_id_drift_unresolved' });
+                    stopPromptTracing();
+                    setPromptReloadHandler(null);
+                    return;
+                  }
+                  const reloaded = await loadDecisions(decisionsPath(sessionDir));
+                  decisions = reloaded.decisions;
+                  components = reloaded.components;
+                  decisionsFileHash = decisionsFingerprint(decisions, components);
+                  continue;
+                }
+              }
+              def.ids = Array.from(new Set([...def.ids, ...ids])).sort((a, b) => a - b);
+              if (selectedFieldId && components[selectedFieldId]?.kind === 'enum') {
+                components[selectedFieldId]!.values = Array.from(
+                  new Set([...(components[selectedFieldId]!.values as number[]), ...ids]),
+                ).sort((a, b) => Number(a) - Number(b));
+              }
+            }
+          }
+
+          if (result.kind === 'enum_value' && result.enumName) {
+            const observed = observedEnumValues(suspect.entry.values);
+            const def = ensureEnumDefinition(decisions, result.enumName);
+            const existing = new Set(def.values);
+            const drift = observed.filter((value) => !existing.has(value));
+            if (drift.length > 0 && def.values.length > 0) {
+              console.warn(
+                `\nEnum value drift detected for ${result.enumName}: ${drift.slice(0, 10).map(String).join(', ')}`
+                + `${drift.length > 10 ? ` ... (+${drift.length - 10} more)` : ''}.`,
+              );
+              const shouldMerge = await promptContinue('Merge these enum values?');
+              if (!shouldMerge) {
+                const ready = await promptContinue('Edit decisions.json to resolve enum value drift, then continue?');
+                if (!ready) {
+                  console.log('  Session saved. Resume later to continue.\n');
+                  await logPipeline('session.pause', { reason: 'enum_value_drift_unresolved' });
+                  stopPromptTracing();
+                  setPromptReloadHandler(null);
+                  return;
+                }
+                const reloaded = await loadDecisions(decisionsPath(sessionDir));
+                decisions = reloaded.decisions;
+                components = reloaded.components;
+                decisionsFileHash = decisionsFingerprint(decisions, components);
+                continue;
+              }
+            }
+            def.values = Array.from(new Set([...def.values, ...observed]));
+            if (selectedFieldId && components[selectedFieldId]?.kind === 'enum') {
+              components[selectedFieldId]!.values = Array.from(
+                new Set([...components[selectedFieldId]!.values, ...observed]),
+              ).sort((a, b) => String(a).localeCompare(String(b)));
+            }
+          }
+
+          if (selectedFieldId) {
+            const existingComponent = components[selectedFieldId];
+            if (existingComponent) {
+              const expectedKind = expectedComponentKindForDecision(result.kind!);
+              if (expectedKind && existingComponent.kind !== expectedKind) {
+                console.error(
+                  `\nKind conflict on ${selectedFieldId}: existing ${existingComponent.kind}, selected ${result.kind}.`,
+                );
+                const ready = await promptContinue('Edit decisions.json to resolve this kind conflict, then continue?');
+                if (!ready) {
+                  console.log('  Session saved. Resume later to continue.\n');
+                  await logPipeline('session.pause', { reason: 'kind_conflict_unresolved' });
+                  stopPromptTracing();
+                  setPromptReloadHandler(null);
+                  return;
+                }
+                const reloaded = await loadDecisions(decisionsPath(sessionDir));
+                decisions = reloaded.decisions;
+                components = reloaded.components;
+                decisionsFileHash = decisionsFingerprint(decisions, components);
+                continue;
+              }
+
+              const inferredTypes = inferPrimitiveTypes(suspect.entry.values);
+              if (hasTypeConflict(existingComponent, inferredTypes)) {
+                console.error(
+                  `\nType conflict on ${selectedFieldId}: existing ${componentTypes(existingComponent).join('|') || existingComponent.baseType}, `
+                  + `current ${inferredTypes.join('|') || 'unknown'}.`,
+                );
+                const ready = await promptContinue('Edit decisions.json to resolve this type conflict, then continue?');
+                if (!ready) {
+                  console.log('  Session saved. Resume later to continue.\n');
+                  await logPipeline('session.pause', { reason: 'type_conflict_unresolved' });
+                  stopPromptTracing();
+                  setPromptReloadHandler(null);
+                  return;
+                }
+                const reloaded = await loadDecisions(decisionsPath(sessionDir));
+                decisions = reloaded.decisions;
+                components = reloaded.components;
+                decisionsFileHash = decisionsFingerprint(decisions, components);
+                continue;
+              }
+            }
+          }
+
+          if (
+            selectedFieldId
+            && (result.kind === 'fk' || result.kind === 'foreign_value')
+            && !(selectedFieldId in components)
+          ) {
+            console.warn(
+              `  Warning: ${suspect.methodName} [${suspect.direction}] ${suspect.parentPath}.${suspect.keyName} `
+              + `references undefined model field "${selectedFieldId}".`,
+            );
+          }
+
           setFieldDecision(decisions, suspect.decisionKey, {
             kind: result.kind!,
             componentId: result.componentId,
             matchesExisting: result.matchesExisting,
+            modelName: modelRef?.modelName,
+            fieldName: modelRef?.fieldName,
+            enumName: result.enumName,
           });
 
           progress.undoStack.push(suspect.decisionKey);
           progress.nextPromptIndex = i + 1;
           await saveProgress(sessionDir, progress);
           await saveDecisions(decisionsPath(sessionDir), decisions, components);
+          decisionsFileHash = decisionsFingerprint(decisions, components);
+          await logPipeline('decision.apply', {
+            decisionKey: suspect.decisionKey,
+            kind: result.kind,
+            componentId: result.componentId,
+            enumName: result.enumName,
+            matchesExisting: result.matchesExisting,
+            promptIndex: i,
+            suggestionUsed: !!shownSuggestion,
+            suggestedKind: shownSuggestion?.kind,
+            suggestedTarget: shownSuggestion ? suggestionTarget(shownSuggestion) : undefined,
+            suggestionConfidence: shownSuggestion?.confidence,
+          });
           i++;
         }
       } else if (mode === 'auto-scalar') {
@@ -407,6 +836,7 @@ async function runSession(
         progress.nextPromptIndex = undecided.length;
         await saveProgress(sessionDir, progress);
         await saveDecisions(decisionsPath(sessionDir), decisions, components);
+        await logPipeline('decision.auto_scalar', { count: undecided.length });
       } else {
         // Batch mode: pre-populate fields with scalar default + values reference, save, let user edit
         for (const s of undecided) {
@@ -439,12 +869,15 @@ async function runSession(
         await saveDecisions(decisionsPath(sessionDir), decisions, components, suspectReference);
         console.log(`\n  Decisions file: ${decisionsPath(sessionDir)}`);
         console.log('  Pre-filled with scalar defaults + _suspectValues for context.');
-        console.log('  Edit each field: choose enum/fk/foreign_value/index_source/value_source and set componentId.');
+        console.log('  Edit each field: choose enum_id/enum_value/fk/foreign_value/index_source/value_source and set componentId/enumName.');
         console.log('  Then resume this session to continue.\n');
 
         const ready = options.assumeBatchEdited || await promptContinue('Have you finished editing decisions.json?');
         if (!ready) {
           console.log('  Session saved. Resume later to continue.\n');
+          await logPipeline('session.pause', { reason: 'batch_waiting_for_edit' });
+          stopPromptTracing();
+          setPromptReloadHandler(null);
           return;
         }
 
@@ -456,7 +889,12 @@ async function runSession(
     }
 
     await saveDecisions(decisionsPath(sessionDir), decisions, components);
+    await logPipeline('step.prompting.done', {
+      decided: Object.keys(decisions.fields).length,
+      components: Object.keys(components).length,
+    });
     progress = await updateStep(sessionDir, 'transformed');
+    await logPipeline('step.transition', { nextStep: progress.step });
   }
 
   // ── Step 6: Transform ──
@@ -466,9 +904,10 @@ async function runSession(
     decisions = reloaded.decisions;
     components = reloaded.components;
 
-    const relationshipWarnings = collectRelationshipWarnings(decisions);
+    const relationshipWarnings = collectRelationshipWarnings(decisions, components);
     progress.relationshipWarnings = relationshipWarnings;
     await saveProgress(sessionDir, progress);
+    await logPipeline('relationship.warnings', { count: relationshipWarnings.length });
 
     // Re-extract and re-infer if needed (we need corpora and schemas)
     if (corpora.length === 0) corpora = await runExtract(sessionDir);
@@ -479,6 +918,11 @@ async function runSession(
     // ── Step 7: Validate ──
     console.log('\nValidating (every sample must pass)...');
     const validation = validateSchemas(corpora, transformedSchemas, components);
+    await logPipeline('validation.summary', {
+      allPass: validation.allPass,
+      methods: validation.results.length,
+      failures: validation.failureRecords.length,
+    });
 
     for (const r of validation.results) {
       const fails = r.requestFailures.length + r.responseFailures.length;
@@ -586,6 +1030,7 @@ async function runSession(
     }
 
     progress = await updateStep(sessionDir, 'validated');
+    await logPipeline('step.transition', { nextStep: progress.step });
   }
 
   // ── Step 8: Emit ──
@@ -604,13 +1049,15 @@ async function runSession(
     const { rootPath, fileCount } = await emitOpenApi(schemas, components, outDir);
     console.log(`  Root: ${rootPath}`);
     console.log(`  Files written: ${fileCount}\n`);
+    await logPipeline('emit.done', { rootPath, fileCount });
 
     progress = await updateStep(sessionDir, 'emitted');
+    await logPipeline('step.transition', { nextStep: progress.step });
   }
 
   {
     const finalDecisions = await loadDecisions(decisionsPath(sessionDir));
-    const warnings = collectRelationshipWarnings(finalDecisions.decisions);
+    const warnings = collectRelationshipWarnings(finalDecisions.decisions, finalDecisions.components);
     progress = await loadProgress(sessionDir);
     progress.relationshipWarnings = warnings;
     await saveProgress(sessionDir, progress);
@@ -646,6 +1093,21 @@ async function runSession(
     console.log(`  Acceptance (kind match): ${acceptanceRate.toFixed(1)}%`);
     console.log(`  Avg decision time: ${avgDecisionMs.toFixed(0)} ms`);
     console.log();
+    await logPipeline('suggestions.metrics', {
+      attemptedCalls: metrics.attemptedCalls,
+      completedCalls: metrics.completedCalls,
+      failedCalls: metrics.failedCalls,
+      cacheHits: metrics.cacheHits,
+      suggestionsShown: metrics.suggestionsShown,
+      decisionCount: metrics.decisionCount,
+      decisionsWithSuggestion: metrics.decisionsWithSuggestion,
+      acceptedKind: metrics.acceptedKind,
+      acceptedExact: metrics.acceptedExact,
+      inputTokens: metrics.inputTokens,
+      outputTokens: metrics.outputTokens,
+      totalTokens: metrics.totalTokens,
+      estimatedCostUsd: metrics.estimatedCostUsd,
+    });
   }
 
   // ── Done ──
@@ -654,6 +1116,12 @@ async function runSession(
   console.log(`  Status    : ${latestProgress.step}`);
   console.log(`  Output    : ${openApiDir(sessionDir)}/`);
   console.log('═══════════════════════════════════════════\n');
+  await logPipeline('session.complete', {
+    status: latestProgress.step,
+    outputDir: `${openApiDir(sessionDir)}/`,
+  });
+  stopPromptTracing();
+  setPromptReloadHandler(null);
 }
 
 // ── Sub-steps ───────────────────────────────────────────────────────

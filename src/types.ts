@@ -80,7 +80,8 @@ export type ScopeDirection = 'request' | 'response';
 // ── Decisions ───────────────────────────────────────────────────────
 
 export type FieldKind =
-  | 'enum'
+  | 'enum_id'
+  | 'enum_value'
   | 'fk'
   | 'foreign_value'
   | 'index_source'
@@ -89,15 +90,35 @@ export type FieldKind =
 
 export interface FieldDecision {
   kind: FieldKind;
-  /** Component name, e.g. "StatusTitleEnum" or "CommitteeIdRef" */
+  /** Canonical model field id, e.g. "Committee.Id" */
   componentId?: string;
   /** References an existing component by ID when user says "same as X" */
   matchesExisting?: string;
+  /** Structured model reference (non-scalar kinds) */
+  modelName?: string;
+  /** Structured field reference (non-scalar kinds) */
+  fieldName?: string;
+  /** Enum name for enum_id / enum_value decisions */
+  enumName?: string;
 }
+
+export interface EnumDefinition {
+  /** Unique observed integer ids */
+  ids: number[];
+  /** Unique observed display values */
+  values: (string | number | boolean)[];
+  /** Optional explicit mapping table (editable in decisions.json) */
+  members?: Array<{ id: number; value: string | number | boolean }>;
+  description?: string;
+}
+
+export type EnumRegistry = Record<string, EnumDefinition>;
 
 export interface Decisions {
   /** decisionKey → decision (scoped key preferred: method::request|response::parentPath::fieldName) */
   fields: Record<string, FieldDecision>;
+  /** enumName -> enum definition */
+  enums: EnumRegistry;
 }
 
 // ── Session ─────────────────────────────────────────────────────────

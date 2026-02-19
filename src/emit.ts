@@ -13,7 +13,7 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import yaml from 'js-yaml';
 import type { MethodSchema, JsonSchema, SharedComponents } from './types.js';
-import { buildComponentSchemas } from './schema-transform.js';
+import { buildComponentSchemas, buildModelSchemas } from './schema-transform.js';
 
 function safeName(method: string): string {
   return method.replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -38,9 +38,11 @@ export async function emitOpenApi(
   const pathsDir = join(outputDir, 'paths');
   const schemasDir = join(outputDir, 'schemas');
   const sharedDir = join(schemasDir, 'shared');
+  const modelsDir = join(schemasDir, 'models');
 
   await mkdir(pathsDir, { recursive: true });
   await mkdir(sharedDir, { recursive: true });
+  await mkdir(modelsDir, { recursive: true });
 
   let fileCount = 0;
 
@@ -48,6 +50,15 @@ export async function emitOpenApi(
   const sharedSchemas = buildComponentSchemas(sharedComponents);
   for (const [id, schema] of Object.entries(sharedSchemas)) {
     await writeFile(join(sharedDir, `${id}.yaml`), dumpYaml(schema), 'utf-8');
+    fileCount++;
+  }
+
+  const modelSchemas = buildModelSchemas(sharedComponents);
+  const modelFileNames: Record<string, string> = {};
+  for (const [modelName, schema] of Object.entries(modelSchemas)) {
+    const fileName = `${safeName(modelName)}.yaml`;
+    modelFileNames[modelName] = fileName;
+    await writeFile(join(modelsDir, fileName), dumpYaml(schema), 'utf-8');
     fileCount++;
   }
 
@@ -115,6 +126,9 @@ export async function emitOpenApi(
   // Add shared component refs to root
   for (const id of Object.keys(sharedSchemas)) {
     componentRefs[id] = { $ref: `schemas/shared/${id}.yaml` };
+  }
+  for (const modelName of Object.keys(modelSchemas)) {
+    componentRefs[modelName] = { $ref: `schemas/models/${modelFileNames[modelName]}` };
   }
 
   // ── Root document ──
@@ -199,6 +213,10 @@ function buildBundledDocument(
   const shared = buildComponentSchemas(sharedComponents);
   for (const [id, schema] of Object.entries(shared)) {
     componentSchemas[id] = schema;
+  }
+  const models = buildModelSchemas(sharedComponents);
+  for (const [modelName, schema] of Object.entries(models)) {
+    componentSchemas[modelName] = schema;
   }
 
   return {

@@ -155,6 +155,22 @@ export function suggestionsPath(sessionDir: string): string {
   return join(sessionDir, 'suggestions.json');
 }
 
+export function logsDir(sessionDir: string): string {
+  return join(sessionDir, 'logs');
+}
+
+export function promptLogPath(sessionDir: string): string {
+  return join(logsDir(sessionDir), 'prompts.jsonl');
+}
+
+export function llmLogPath(sessionDir: string): string {
+  return join(logsDir(sessionDir), 'llm.jsonl');
+}
+
+export function pipelineLogPath(sessionDir: string): string {
+  return join(logsDir(sessionDir), 'pipeline.jsonl');
+}
+
 export function openApiDir(sessionDir: string): string {
   return join(sessionDir, 'openapi');
 }

@@ -1,4 +1,4 @@
-import type { Decisions, FieldDecision } from './types.js';
+import type { Decisions, FieldDecision, SharedComponents } from './types.js';
 import { parseScopedFieldKey } from './scoped-field.js';
 
 export interface RelationshipConflict {
@@ -43,15 +43,84 @@ export function detectRelationshipConflicts(decisions: Decisions): RelationshipC
   return [];
 }
 
-export function collectRelationshipWarnings(decisions: Decisions): string[] {
+export function collectRelationshipWarnings(
+  decisions: Decisions,
+  components: SharedComponents,
+): string[] {
   const { indexSources, valueSources } = sourceMaps(decisions);
   const warnings: string[] = [];
+  const definedFields = new Set(Object.keys(components));
 
   for (const [decisionKey, decision] of Object.entries(decisions.fields)) {
     const fieldId = decisionFieldId(decision);
+    if ((decision.kind === 'enum_id' || decision.kind === 'enum_value')) {
+      const enumName = decision.enumName;
+      if (!enumName) {
+        warnings.push(
+          `${formatDecision(decisionKey)} is ${decision.kind} but enumName is missing.`,
+        );
+        continue;
+      }
+      const enumDef = decisions.enums[enumName];
+      if (!enumDef) {
+        warnings.push(
+          `${formatDecision(decisionKey)} references enum "${enumName}" but it is not defined.`,
+        );
+        continue;
+      }
+      if (decision.kind === 'enum_id' && enumDef.values.length === 0) {
+        warnings.push(
+          `${formatDecision(decisionKey)} references enum "${enumName}" id, but no enum_value values are defined yet.`,
+        );
+      }
+      if (decision.kind === 'enum_value' && enumDef.ids.length === 0) {
+        warnings.push(
+          `${formatDecision(decisionKey)} references enum "${enumName}" value, but no enum_id values are defined yet.`,
+        );
+      }
+      if (enumDef.ids.length > 0 && enumDef.values.length > 0 && enumDef.ids.length !== enumDef.values.length) {
+        warnings.push(
+          `Enum "${enumName}" has ${enumDef.ids.length} ids and ${enumDef.values.length} values; expected one-to-one mapping.`,
+        );
+      }
+      if (enumDef.members && enumDef.members.length > 0) {
+        const ids = new Set<number>();
+        const values = new Set<string | number | boolean>();
+        for (const member of enumDef.members) {
+          if (ids.has(member.id)) {
+            warnings.push(`Enum "${enumName}" has duplicate member id ${member.id}.`);
+            break;
+          }
+          ids.add(member.id);
+          if (values.has(member.value)) {
+            warnings.push(`Enum "${enumName}" has duplicate member value ${String(member.value)}.`);
+            break;
+          }
+          values.add(member.value);
+        }
+      }
+      continue;
+    }
+
     if (!fieldId) continue;
 
-    if (decision.kind === 'fk' && !indexSources.has(fieldId)) {
+    if (decision.kind === 'fk' && !definedFields.has(fieldId)) {
+      warnings.push(
+        `${formatDecision(decisionKey)} references undefined model field "${fieldId}" as fk.`,
+      );
+    } else if (decision.kind === 'foreign_value' && !definedFields.has(fieldId)) {
+      warnings.push(
+        `${formatDecision(decisionKey)} references undefined model field "${fieldId}" as foreign_value.`,
+      );
+    } else if (decision.kind === 'index_source' && !definedFields.has(fieldId)) {
+      warnings.push(
+        `${formatDecision(decisionKey)} declares index_source for undefined model field "${fieldId}".`,
+      );
+    } else if (decision.kind === 'value_source' && !definedFields.has(fieldId)) {
+      warnings.push(
+        `${formatDecision(decisionKey)} declares value_source for undefined model field "${fieldId}".`,
+      );
+    } else if (decision.kind === 'fk' && !indexSources.has(fieldId)) {
       warnings.push(
         `${formatDecision(decisionKey)} references "${fieldId}" as fk, but no index_source is defined for that field.`,
       );
