@@ -35,14 +35,14 @@ async function main(): Promise<void> {
   ];
 
   const components: SharedComponents = {
-    StatusEnum: { kind: 'enum', baseType: 'string', values: ['active', 'draft'] },
-    CommitteeIdRef: { kind: 'fk', baseType: 'integer', values: [] },
+    'Status.Value': { kind: 'field', baseType: 'string', values: ['active', 'draft'] },
+    'Committee.Id': { kind: 'field', baseType: 'integer', values: [] },
   };
 
   try {
     const result = await emitOpenApi(schemas, components, outputDir);
     assert.ok(result.rootPath.endsWith('openapi.yaml'));
-    assert.equal(result.fileCount, 10, 'expected shared + per-method + root + bundled file count');
+    assert.equal(result.fileCount, 12, 'expected shared + model + per-method + root + bundled file count');
 
     await stat(join(outputDir, 'openapi.yaml'));
     await stat(join(outputDir, 'openapi.bundled.json'));
@@ -51,19 +51,21 @@ async function main(): Promise<void> {
     assert.deepEqual(pathFiles.sort(), ['Get_Members.yaml', 'Get_Sessions_.yaml']);
 
     const sharedFiles = await readdir(join(outputDir, 'schemas', 'shared'));
-    assert.deepEqual(sharedFiles.sort(), ['CommitteeIdRef.yaml', 'StatusEnum.yaml']);
+    assert.deepEqual(sharedFiles.sort(), ['Committee.Id.yaml', 'Status.Value.yaml']);
+    const modelFiles = await readdir(join(outputDir, 'schemas', 'models'));
+    assert.deepEqual(modelFiles.sort(), ['Committee.yaml', 'Status.yaml']);
 
     const rootDoc = yaml.load(await readFile(join(outputDir, 'openapi.yaml'), 'utf-8')) as Record<string, any>;
     assert.equal(rootDoc.openapi, '3.0.3');
     assert.ok(rootDoc.paths['/rpc/Get_Members']);
     assert.ok(rootDoc.paths['/rpc/Get_Sessions_']);
-    assert.equal(rootDoc.components.schemas.StatusEnum.$ref, 'schemas/shared/StatusEnum.yaml');
+    assert.equal(rootDoc.components.schemas['Status.Value'].$ref, 'schemas/shared/Status.Value.yaml');
 
     const bundled = JSON.parse(await readFile(join(outputDir, 'openapi.bundled.json'), 'utf-8')) as Record<string, any>;
     assert.ok(bundled.paths['/rpc/Get_Members']);
     assert.ok(bundled.paths['/rpc/Get_Sessions_']);
-    assert.ok(bundled.components.schemas.StatusEnum.enum.includes('active'));
-    assert.equal(bundled.components.schemas.CommitteeIdRef.type, 'integer');
+    assert.equal(bundled.components.schemas['Status.Value'].type, 'string');
+    assert.equal(bundled.components.schemas['Committee.Id'].type, 'integer');
 
     const pathDoc = yaml.load(await readFile(join(outputDir, 'paths', 'Get_Sessions_.yaml'), 'utf-8')) as Record<string, any>;
     assert.equal(pathDoc.post.operationId, 'Get_Sessions_');

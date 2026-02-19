@@ -1,17 +1,18 @@
 /**
- * Interactive prompts for user decisions (scalar/enum/fk/foreign value/source roles).
- * Uses @inquirer/prompts for the interactive UI.
+ * Interactive prompts for user decisions.
+ * Decision flow:
+ * 1) choose accept/back/manual path
+ * 2) decide source role (optional)
+ * 3) decide reference role (optional)
+ * Scalar is implied when both source and reference are not selected.
  */
 
 import { select, confirm, input } from '@inquirer/prompts';
 import { emitKeypressEvents } from 'node:readline';
-import type { FieldKind, SharedComponents, SharedComponent, EnumRegistry } from '../types.js';
+import type { FieldKind, SharedComponents, SharedComponent } from '../types.js';
 import type { Suspect } from '../value-registry.js';
-import type { SuggestionAdvice } from '../llm/types.js';
-import {
-  addComponent,
-  enumComponentId,
-} from '../decisions.js';
+import type { SuggestionAdvice, SuggestionChoice } from '../llm/types.js';
+import { addComponent } from '../decisions.js';
 
 export interface PromptTraceEvent {
   timestamp: string;
@@ -171,15 +172,13 @@ interface ModelFieldRef {
 export interface PromptResult {
   action: 'apply' | 'back';
   kind?: FieldKind;
-  componentId?: string;
-  matchesExisting?: string;
-  enumName?: string;
+  sourceFieldId?: string;
+  referenceFieldId?: string;
 }
 
 export async function promptForSuspect(
   suspect: Suspect,
   components: SharedComponents,
-  enums: EnumRegistry,
   index: number,
   total: number,
   suggestion?: SuggestionAdvice,
@@ -189,129 +188,226 @@ export async function promptForSuspect(
   let totalOccurrences = 0;
   for (const c of entry.counts.values()) totalOccurrences += c;
 
-  console.log(`\n[${ index + 1}/${total}] Field: ${keyName}`);
+  console.log(`\n[${index + 1}/${total}] Field: ${keyName}`);
   console.log(`  Method: ${methodName}  |  Side: ${direction}  |  Parent: ${suspect.parentPath}`);
   console.log(`  Unique values: ${uniqueCount}  |  Total occurrences: ${totalOccurrences}`);
   console.log(`  Values: ${formatValues(entry.values)}`);
   if (suggestion) {
-    const suggestionTarget = suggestedTargetLabel(suggestion);
-    const sourceHint = suggestion.sourceReferenceFieldId
-      ? ` | source hint: ${suggestion.sourceReferenceFieldId}`
-      : '';
-    console.log(
-      `  Suggested: ${suggestion.kind} (${suggestion.confidence.toFixed(2)})`
-      + `${suggestionTarget ? ` -> ${suggestionTarget}` : ''}${sourceHint}`,
-    );
-    console.log(`  Why: ${suggestion.reason}`);
+    const sourceText = suggestion.source.recommended === 'yes'
+      ? `yes -> ${suggestion.source.yesPayload.fieldId}`
+      : 'no';
+    const referenceText = suggestion.reference.recommended === 'yes'
+      ? `yes -> ${suggestion.reference.yesPayload.fieldId}`
+      : 'no';
+    console.log(`  Suggested source step: ${sourceText}`);
+    console.log(`  Suggested reference step: ${referenceText}`);
+    if (suggestion.source.recommended === 'no' && suggestion.reference.recommended === 'no') {
+      console.log('  Implied scalar outcome: yes (both roles are no)');
+    }
+    console.log(`  Why: ${suggestion.overallReason}`);
   }
 
-  const valuesArr = Array.from(entry.values);
-
-  const selectChoices: { value: FieldKind | '__back__' | '__accept__'; name: string }[] = [];
-  const canAccept = canAcceptSuggestion(suggestion);
-  if (canAccept && suggestion) {
-    selectChoices.push({
-      value: '__accept__',
-      name: `Accept suggestion: ${suggestion.kind}${suggestedTargetLabel(suggestion) ? ` -> ${suggestedTargetLabel(suggestion)}` : ''}`,
-    });
-  }
-  selectChoices.push({ value: '__back__', name: 'Go back to previous field (undo last decision)' });
-  selectChoices.push({ value: 'scalar', name: 'Scalar (plain string/number/boolean)' });
-  selectChoices.push({ value: 'enum_id', name: 'Enum ID (ordinal integer id)' });
-  selectChoices.push({ value: 'enum_value', name: 'Enum Value (display/value label)' });
-  selectChoices.push({ value: 'fk', name: 'Foreign Key (reference to another entity)' });
-  selectChoices.push({ value: 'foreign_value', name: 'Foreign Value (resolved/display value from another entity)' });
-  selectChoices.push({ value: 'index_source', name: 'Index Source (actual source field for a foreign key)' });
-  selectChoices.push({ value: 'value_source', name: 'Value Source (actual source field for a foreign value)' });
-
-  let kindSelection: FieldKind | '__back__' | '__accept__';
-  while (true) {
-    kindSelection = await tracedSelect<FieldKind | '__back__' | '__accept__'>('suspect.kind', {
-      message: `What is "${keyName}"?`,
-      choices: selectChoices,
-    });
-    if (kindSelection !== '__accept__') break;
-    const accepted = applyAcceptedSuggestion(suggestion, components, keyName, entry.values);
-    if (accepted) return accepted;
-    console.log('  Suggestion is missing required details. Choose manually.\n');
-  }
-
-  if (kindSelection === '__back__') {
-    return { action: 'back' };
-  }
-
-  const kind = kindSelection;
-
-  if (kind === 'scalar') {
-    return { action: 'apply', kind };
-  }
-
-  // Determine base type from values
   const inferredType = inferBaseType(entry.values);
+  const valuesArr = Array.from(entry.values);
+  const topSelectChoices: { value: '__manual__' | '__back__' | '__accept__'; name: string }[] = [];
+  if (canAcceptSuggestion(suggestion)) {
+    topSelectChoices.push({ value: '__accept__', name: `Accept full suggestion path` });
+  }
+  topSelectChoices.push({ value: '__back__', name: 'Go back to previous field (undo last decision)' });
+  topSelectChoices.push({ value: '__manual__', name: 'Choose source/reference roles manually' });
 
-  if (kind === 'enum_id' || kind === 'enum_value') {
-    const suggestedEnumName = nonEmpty(suggestion?.newComponentName)
-      ?? nonEmpty(suggestion?.targetFieldId)
-      ?? suggestModelName(keyName);
-    const enumName = await promptEnumName(enums, suggestedEnumName);
-    const fieldId = enumComponentId(enumName, kind === 'enum_id' ? 'id' : 'value');
+  while (true) {
+    const startAction = await tracedSelect<'__manual__' | '__back__' | '__accept__'>('suspect.path', {
+      message: `How should "${keyName}" be classified?`,
+      choices: topSelectChoices,
+    });
 
-    if (!components[fieldId]) {
-      const component = componentForKind(kind, inferredType, valuesArr, keyName);
-      if (component) {
-        addComponent(components, fieldId, component);
-      }
+    if (startAction === '__back__') return { action: 'back' };
+    if (startAction === '__accept__') {
+      const accepted = await applyAcceptedSuggestion(
+        suggestion,
+        components,
+        keyName,
+        inferredType,
+        valuesArr,
+      );
+      if (accepted) return accepted;
+      console.log('  Suggestion path is incomplete. Choose manually.\n');
+      continue;
     }
 
-    return { action: 'apply', kind, componentId: fieldId, enumName };
-  }
+    // Manual role selection flow.
+    const sourceDecision = await promptBinaryStep(
+      'suspect.source',
+      'Should this field map to a source model field?',
+      suggestion?.source.recommended,
+      suggestion?.source.yesPayload.fieldId,
+    );
+    const sourceFieldId = sourceDecision === 'yes'
+      ? await promptForModelField(
+        components,
+        keyName,
+        suggestion?.source.yesPayload.fieldId,
+      )
+      : undefined;
 
-  // Create or link a model field definition.
-  const modelField = await promptForModelField(kind, components, keyName, suggestion);
-  const fieldId = `${modelField.modelName}.${modelField.fieldName}`;
+    const referenceDecision = await promptBinaryStep(
+      'suspect.reference',
+      'Should this field reference another model field?',
+      suggestion?.reference.recommended,
+      suggestion?.reference.yesPayload.fieldId,
+    );
+    const referenceFieldId = referenceDecision === 'yes'
+      ? await promptForModelField(
+        components,
+        `${keyName}Reference`,
+        suggestion?.reference.yesPayload.fieldId,
+      )
+      : undefined;
 
-  const shouldDefineField = (
-    kind === 'index_source'
-    || kind === 'value_source'
-  );
-  if (shouldDefineField && !components[fieldId]) {
-    const component = componentForKind(kind, inferredType, valuesArr, keyName);
-    if (component) {
-      addComponent(components, fieldId, component);
+    if (sourceFieldId) {
+      ensureComponent(components, sourceFieldId, inferredType, valuesArr, `Model field for ${keyName}`);
     }
-  }
+    if (referenceFieldId && !components[referenceFieldId]) {
+      // For pure reference targets, create a placeholder field component if it does not yet exist.
+      ensureComponent(components, referenceFieldId, inferredType, [], `Reference target for ${keyName}`);
+    }
 
-  return { action: 'apply', kind, componentId: fieldId };
+    return {
+      action: 'apply',
+      kind: fieldKindFromFlags(!!sourceFieldId, !!referenceFieldId),
+      sourceFieldId,
+      referenceFieldId,
+    };
+  }
 }
 
-function componentForKind(
-  kind: FieldKind,
+async function promptBinaryStep(
+  context: string,
+  message: string,
+  suggested: SuggestionChoice | undefined,
+  suggestedFieldId?: string,
+): Promise<SuggestionChoice> {
+  const yesLabel = suggested === 'yes'
+    ? `Yes (suggested${suggestedFieldId ? ` -> ${suggestedFieldId}` : ''})`
+    : 'Yes';
+  const noLabel = suggested === 'no' ? 'No (suggested)' : 'No';
+  return tracedSelect<SuggestionChoice>(context, {
+    message,
+    choices: [
+      { value: 'yes', name: yesLabel },
+      { value: 'no', name: noLabel },
+    ],
+  });
+}
+
+function canAcceptSuggestion(suggestion: SuggestionAdvice | undefined): boolean {
+  if (!suggestion) return false;
+  return (
+    suggestion.source.recommended === 'yes'
+    || suggestion.reference.recommended === 'yes'
+    || (suggestion.source.recommended === 'no' && suggestion.reference.recommended === 'no')
+  );
+}
+
+async function applyAcceptedSuggestion(
+  suggestion: SuggestionAdvice | undefined,
+  components: SharedComponents,
+  keyName: string,
   inferredType: { baseType: string; baseTypes?: string[] },
   values: (string | number | boolean)[],
-  keyName: string,
-): SharedComponent | null {
-  if (kind === 'scalar') return null;
+): Promise<PromptResult | undefined> {
+  if (!suggestion) return undefined;
 
-  const componentKind = (
-    kind === 'enum_id' || kind === 'enum_value' ? 'enum'
-      : kind === 'index_source' ? 'fk'
-        : kind === 'value_source' ? 'foreign_value'
-          : kind
-  );
+  let sourceFieldId = suggestion.source.recommended === 'yes'
+    ? normalizeModelFieldId(suggestion.source.yesPayload.fieldId)
+    : undefined;
+  let referenceFieldId = suggestion.reference.recommended === 'yes'
+    ? normalizeModelFieldId(suggestion.reference.yesPayload.fieldId)
+    : undefined;
+
+  if (suggestion.source.recommended === 'yes') {
+    const sourceChoice = await tracedSelect<'use' | 'edit' | 'skip'>('suggestion.accept.source', {
+      message: `Apply suggested source target${sourceFieldId ? ` (${sourceFieldId})` : ''}?`,
+      choices: [
+        { value: 'use', name: 'Use suggested source target' },
+        { value: 'edit', name: 'Edit source target' },
+        { value: 'skip', name: 'Do not set source role' },
+      ],
+    });
+    if (sourceChoice === 'edit') {
+      sourceFieldId = await promptForModelField(components, keyName, sourceFieldId);
+    } else if (sourceChoice === 'skip') {
+      sourceFieldId = undefined;
+    }
+  }
+
+  if (suggestion.reference.recommended === 'yes') {
+    const referenceChoice = await tracedSelect<'use' | 'edit' | 'skip'>('suggestion.accept.reference', {
+      message: `Apply suggested reference target${referenceFieldId ? ` (${referenceFieldId})` : ''}?`,
+      choices: [
+        { value: 'use', name: 'Use suggested reference target' },
+        { value: 'edit', name: 'Edit reference target' },
+        { value: 'skip', name: 'Do not set reference role' },
+      ],
+    });
+    if (referenceChoice === 'edit') {
+      referenceFieldId = await promptForModelField(
+        components,
+        `${keyName}Reference`,
+        referenceFieldId,
+      );
+    } else if (referenceChoice === 'skip') {
+      referenceFieldId = undefined;
+    }
+  }
+
+  if (!sourceFieldId && !referenceFieldId) {
+    // Implied scalar outcome: neither source nor reference role is selected.
+    return { action: 'apply', kind: 'scalar' };
+  }
+
+  if (sourceFieldId) {
+    ensureComponent(components, sourceFieldId, inferredType, values, `Model field for ${keyName}`);
+  }
+  if (referenceFieldId && !components[referenceFieldId]) {
+    ensureComponent(components, referenceFieldId, inferredType, [], `Reference target for ${keyName}`);
+  }
 
   return {
-    kind: componentKind,
-    baseType: kind === 'enum_id' ? 'integer' : inferredType.baseType,
-    ...(kind !== 'enum_id' && inferredType.baseTypes ? { baseTypes: inferredType.baseTypes } : {}),
-    values: componentKind === 'enum'
-      ? values.sort((a, b) => String(a).localeCompare(String(b)))
-      : [],
-    description: componentKind === 'enum'
-      ? `Enum for ${keyName}`
-      : componentKind === 'foreign_value'
-        ? `Foreign value: ${keyName}`
-        : `Reference: ${keyName}`,
+    action: 'apply',
+    kind: fieldKindFromFlags(!!sourceFieldId, !!referenceFieldId),
+    sourceFieldId,
+    referenceFieldId,
   };
+}
+
+function fieldKindFromFlags(
+  hasSource: boolean,
+  hasReference: boolean,
+): FieldKind {
+  if (hasSource && hasReference) return 'source_reference';
+  if (hasSource) return 'source';
+  if (hasReference) return 'reference';
+  return 'scalar';
+}
+
+function ensureComponent(
+  components: SharedComponents,
+  fieldId: string,
+  inferredType: { baseType: string; baseTypes?: string[] },
+  values: (string | number | boolean)[],
+  description: string,
+): void {
+  if (components[fieldId]) return;
+  const component: SharedComponent = {
+    kind: 'field',
+    baseType: inferredType.baseType,
+    ...(inferredType.baseTypes ? { baseTypes: inferredType.baseTypes } : {}),
+    values: [...values],
+    description,
+  };
+  addComponent(components, fieldId, component);
 }
 
 function inferBaseType(
@@ -341,105 +437,12 @@ function inferBaseType(
   return { baseType: 'mixed', baseTypes };
 }
 
-function suggestedFieldIdForKind(
-  kind: FieldKind,
-  suggestion?: SuggestionAdvice,
-): string | undefined {
-  if (!suggestion) return undefined;
-  if (suggestion.reuseComponentId && (kind === 'enum_id' || kind === 'enum_value')) {
-    return suggestion.reuseComponentId;
-  }
-  if (suggestion.targetFieldId) return suggestion.targetFieldId;
-  if (suggestion.newComponentName && (kind === 'enum_id' || kind === 'enum_value')) {
-    return suggestion.newComponentName;
-  }
-  return undefined;
-}
-
-function suggestedTargetLabel(suggestion: SuggestionAdvice): string | undefined {
-  return suggestion.reuseComponentId
-    ?? suggestion.targetFieldId
-    ?? suggestion.newComponentName;
-}
-
-function canAcceptSuggestion(
-  suggestion: SuggestionAdvice | undefined,
-): boolean {
-  if (!suggestion) return false;
-  if (suggestion.kind === 'scalar') return true;
-
-  const candidateId = nonEmpty(suggestion.reuseComponentId)
-    ?? nonEmpty(suggestion.targetFieldId)
-    ?? nonEmpty(suggestion.newComponentName);
-  if (!candidateId) return false;
-  if (suggestion.kind === 'enum_id' || suggestion.kind === 'enum_value') {
-    return candidateId.trim().length > 0;
-  }
-  const parsed = parseModelFieldId(candidateId);
-  if (!parsed) return false;
-  if (suggestion.kind === 'index_source' || suggestion.kind === 'value_source') return true;
-  // fk/foreign_value may legitimately reference undefined model fields.
-  return parsed.modelName.length > 0 && parsed.fieldName.length > 0;
-}
-
-function applyAcceptedSuggestion(
-  suggestion: SuggestionAdvice | undefined,
-  components: SharedComponents,
-  keyName: string,
-  values: Set<string | number | boolean>,
-): PromptResult | undefined {
-  if (!suggestion) return undefined;
-
-  if (suggestion.kind === 'scalar') {
-    return { action: 'apply', kind: 'scalar' };
-  }
-
-  const valuesArr = Array.from(values);
-  const inferredType = inferBaseType(values);
-  const candidateId = nonEmpty(suggestion.reuseComponentId)
-    ?? nonEmpty(suggestion.targetFieldId)
-    ?? nonEmpty(suggestion.newComponentName);
-  if (!candidateId) return undefined;
-
-  if (suggestion.kind === 'enum_id' || suggestion.kind === 'enum_value') {
-    const enumName = candidateId.trim();
-    if (!enumName) return undefined;
-    const componentId = enumComponentId(enumName, suggestion.kind === 'enum_id' ? 'id' : 'value');
-    if (!components[componentId]) {
-      const component = componentForKind(suggestion.kind, inferredType, valuesArr, keyName);
-      if (component) addComponent(components, componentId, component);
-    }
-    return { action: 'apply', kind: suggestion.kind, componentId, enumName };
-  }
-
-  const parsed = parseModelFieldId(candidateId);
-  if (!parsed) return undefined;
-
-  if (
-    (suggestion.kind === 'index_source' || suggestion.kind === 'value_source')
-    && !components[candidateId]
-  ) {
-    const component = componentForKind(suggestion.kind, inferredType, valuesArr, keyName);
-    if (component) addComponent(components, candidateId, component);
-  }
-
-  return { action: 'apply', kind: suggestion.kind, componentId: candidateId };
-}
-
-function nonEmpty(value: string | undefined): string | undefined {
-  if (!value) return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
 async function promptForModelField(
-  kind: FieldKind,
   components: SharedComponents,
   keyName: string,
-  suggestion?: SuggestionAdvice,
-): Promise<ModelFieldRef> {
+  suggestedFieldId?: string,
+): Promise<string> {
   const known = knownModels(components);
-  const suggestedFieldId = suggestedFieldIdForKind(kind, suggestion);
   const suggested = parseModelFieldId(suggestedFieldId);
 
   const defaultModelName = suggested?.modelName ?? suggestModelName(keyName);
@@ -448,31 +451,7 @@ async function promptForModelField(
   const defaultFieldName = suggested?.fieldName ?? suggestSimpleFieldName(keyName);
   const existingFields = known.get(modelName) ?? [];
   const fieldName = await promptFieldName(existingFields, defaultFieldName, modelName);
-
-  return { modelName, fieldName };
-}
-
-async function promptEnumName(
-  enums: EnumRegistry,
-  defaultEnumName: string,
-): Promise<string> {
-  const enumNames = Object.keys(enums).sort((a, b) => a.localeCompare(b));
-  if (enumNames.length === 0) {
-    const raw = await tracedInput('enum.name', { message: 'Enum name:', default: defaultEnumName });
-    return requireText(raw, defaultEnumName);
-  }
-
-  const enumChoice = await tracedSelect<string>('enum.select', {
-    message: 'Select enum:',
-    choices: [
-      ...enumNames.map((name) => ({ value: name, name })),
-      { value: '__new__', name: 'Create new enum' },
-    ],
-  });
-
-  if (enumChoice !== '__new__') return enumChoice;
-  const raw = await tracedInput('enum.new', { message: 'New enum name:', default: defaultEnumName });
-  return requireText(raw, defaultEnumName);
+  return `${modelName}.${fieldName}`;
 }
 
 function knownModels(components: SharedComponents): Map<string, string[]> {
@@ -537,14 +516,23 @@ async function promptFieldName(
   return requireText(raw, defaultFieldName);
 }
 
+function normalizeModelFieldId(value: string | undefined): string | undefined {
+  const parsed = parseModelFieldId(value);
+  if (!parsed) return undefined;
+  return `${parsed.modelName}.${parsed.fieldName}`;
+}
+
 function parseModelFieldId(value: string | undefined): ModelFieldRef | null {
   if (!value) return null;
   const trimmed = value.trim();
+  if (trimmed.includes('[]') || trimmed.includes('::') || trimmed.includes('/')) return null;
   const lastDot = trimmed.lastIndexOf('.');
   if (lastDot <= 0 || lastDot >= trimmed.length - 1) return null;
   const modelName = trimmed.slice(0, lastDot).trim();
   const fieldName = trimmed.slice(lastDot + 1).trim();
   if (!modelName || !fieldName) return null;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(modelName)) return null;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(fieldName)) return null;
   return { modelName, fieldName };
 }
 

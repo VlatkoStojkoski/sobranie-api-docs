@@ -155,6 +155,10 @@ export function suggestionsPath(sessionDir: string): string {
   return join(sessionDir, 'suggestions.json');
 }
 
+export function llmUsagePath(sessionDir: string): string {
+  return join(sessionDir, 'llm-usage.json');
+}
+
 export function logsDir(sessionDir: string): string {
   return join(sessionDir, 'logs');
 }
