@@ -80,19 +80,25 @@ export type ScopeDirection = 'request' | 'response';
 // ── Decisions ───────────────────────────────────────────────────────
 
 export type FieldKind =
-  | 'enum'
-  | 'fk'
-  | 'foreign_value'
-  | 'index_source'
-  | 'value_source'
-  | 'scalar';
+  | 'scalar'
+  | 'source'
+  | 'reference'
+  | 'source_reference';
 
 export interface FieldDecision {
   kind: FieldKind;
-  /** Component name, e.g. "StatusTitleEnum" or "CommitteeIdRef" */
-  componentId?: string;
-  /** References an existing component by ID when user says "same as X" */
-  matchesExisting?: string;
+  /** Canonical model field id where this field is modeled, e.g. "Material.Title" */
+  sourceFieldId?: string;
+  /** Canonical target model field this field references, e.g. "Structure.Id" */
+  referenceFieldId?: string;
+  /** Structured source model reference (optional convenience metadata) */
+  modelName?: string;
+  /** Structured source field reference (optional convenience metadata) */
+  fieldName?: string;
+  /** Structured reference model reference (optional convenience metadata) */
+  referenceModelName?: string;
+  /** Structured reference field reference (optional convenience metadata) */
+  referenceFieldName?: string;
 }
 
 export interface Decisions {
@@ -131,15 +137,15 @@ export interface ValidationFailureRecord {
   responseErrors: string[];
 }
 
-// ── Shared component registry (enums + FKs) ────────────────────────
+// ── Shared model field registry ─────────────────────────────────────
 
 export interface SharedComponent {
-  kind: 'enum' | 'fk' | 'foreign_value';
+  kind: 'field';
   /** The base type (string, integer, number, boolean, mixed) */
   baseType: string;
   /** Optional explicit base types (used when baseType is mixed) */
   baseTypes?: string[];
-  /** For enums: the closed set of values; for FKs: empty */
+  /** Observed values for this modeled field (optional signal for overlap/type inference) */
   values: (string | number | boolean)[];
   /** Description for the component */
   description?: string;

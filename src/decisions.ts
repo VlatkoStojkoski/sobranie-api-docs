@@ -1,14 +1,21 @@
 /**
- * Decisions: load/save user decisions (enum/FK/scalar classifications)
+ * Decisions: load/save user decisions (scalar/source/reference classifications)
  * and manage the undo stack.
  */
 
 import { readFile, writeFile } from 'node:fs/promises';
-import type { Decisions, FieldDecision, SharedComponents, SharedComponent, ScopeDirection } from './types.js';
+import type {
+  Decisions,
+  FieldDecision,
+  SharedComponents,
+  SharedComponent,
+  ScopeDirection,
+} from './types.js';
 
 // ── Serializable format (JSON-friendly) ─────────────────────────────
 
 interface DecisionsFile {
+  version: 4;
   fields: Record<string, FieldDecision>;
   components: SharedComponents;
 }
@@ -25,14 +32,36 @@ export function createEmptyDecisions(): { decisions: Decisions; components: Shar
 export async function loadDecisions(path: string): Promise<{ decisions: Decisions; components: SharedComponents }> {
   try {
     const raw = await readFile(path, 'utf-8');
-    const data: DecisionsFile = JSON.parse(raw);
+    const data = JSON.parse(raw) as DecisionsFile;
+    if (!isDecisionsFile(data)) {
+      throw new Error('Invalid decisions.json schema');
+    }
     return {
       decisions: { fields: data.fields ?? {} },
       components: data.components ?? {},
     };
-  } catch {
-    return createEmptyDecisions();
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return createEmptyDecisions();
+    }
+    throw error;
   }
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return !!error
+    && typeof error === 'object'
+    && 'code' in error
+    && (error as { code?: string }).code === 'ENOENT';
+}
+
+function isDecisionsFile(value: unknown): value is DecisionsFile {
+  if (!value || typeof value !== 'object') return false;
+  const obj = value as { version?: unknown; fields?: unknown; components?: unknown };
+  if (obj.version !== 4) return false;
+  if (!obj.fields || typeof obj.fields !== 'object') return false;
+  if (!obj.components || typeof obj.components !== 'object') return false;
+  return true;
 }
 
 /** Optional reference for batch edit: decisionKey -> metadata + values */
@@ -53,6 +82,7 @@ export async function saveDecisions(
   suspectReference?: SuspectReference,
 ): Promise<void> {
   const data: DecisionsFile & { _suspectValues?: SuspectReference } = {
+    version: 4,
     fields: decisions.fields,
     components,
   };
@@ -108,7 +138,7 @@ export function findOverlappingComponents(
   const matches: { id: string; component: SharedComponent; overlapCount: number }[] = [];
 
   for (const [id, comp] of Object.entries(components)) {
-    if (comp.kind !== 'enum') continue;
+    if (!Array.isArray(comp.values) || comp.values.length === 0) continue;
     let overlap = 0;
     for (const v of comp.values) {
       if (valueSet.has(v)) overlap++;
@@ -178,9 +208,9 @@ function inferTypesFromValues(values: (string | number | boolean)[]): string[] {
 export function generateComponentId(
   components: SharedComponents,
   keyName: string,
-  kind: 'enum' | 'fk' | 'foreign_value',
+  kind: 'field',
 ): string {
-  const suffix = kind === 'enum' ? 'Enum' : kind === 'foreign_value' ? 'Value' : 'Ref';
+  const suffix = kind === 'field' ? 'Field' : 'Field';
   const base = `${keyName}${suffix}`;
   if (!(base in components)) return base;
 

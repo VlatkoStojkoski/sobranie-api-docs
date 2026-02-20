@@ -45,20 +45,27 @@ async function main(): Promise<void> {
       .sort((a, b) => a.localeCompare(b))
       .filter((v, i, arr) => (i === 0 ? true : v !== arr[i - 1]));
 
-    addComponent(components, 'StatusEnum', {
-      kind: 'enum',
+    addComponent(components, 'Status.Value', {
+      kind: 'field',
       baseType: 'string',
       values: statusValues,
+      description: 'Status source field',
     });
-    // Two scoped fields can intentionally share a single component.
-    setFieldDecision(decisions, legislationResponseStatus.decisionKey, { kind: 'enum', componentId: 'StatusEnum' });
-    setFieldDecision(decisions, sessionsResponseStatus.decisionKey, { kind: 'enum', componentId: 'StatusEnum' });
+
+    setFieldDecision(decisions, legislationResponseStatus.decisionKey, {
+      kind: 'source',
+      sourceFieldId: 'Status.Value',
+    });
+    setFieldDecision(decisions, sessionsResponseStatus.decisionKey, {
+      kind: 'source',
+      sourceFieldId: 'Status.Value',
+    });
 
     const transformed = transformSchemas(schemas, decisions, components);
     const transformedJson = JSON.stringify(transformed);
     assert.ok(
-      transformedJson.includes('#/components/schemas/StatusEnum'),
-      'transformed schemas should include shared enum refs',
+      transformedJson.includes('#/components/schemas/Status.Value'),
+      'transformed schemas should include shared model field refs',
     );
 
     const validation = validateSchemas(corpora, transformed, components);
@@ -75,11 +82,11 @@ async function main(): Promise<void> {
     assert.equal(paths.length, schemas.length);
 
     const shared = await readdir(join(outDir, 'schemas', 'shared'));
-    assert.deepEqual(shared, ['StatusEnum.yaml']);
+    assert.deepEqual(shared, ['Status.Value.yaml']);
 
     const bundled = JSON.parse(await readFile(join(outDir, 'openapi.bundled.json'), 'utf-8')) as Record<string, any>;
     assert.equal(Object.keys(bundled.paths).length, schemas.length);
-    assert.ok(bundled.components.schemas.StatusEnum.enum.length > 0);
+    assert.equal(bundled.components.schemas['Status.Value'].type, 'string');
 
     console.log('PASS test-e2e.ts');
   } finally {

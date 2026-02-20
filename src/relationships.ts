@@ -1,75 +1,36 @@
-import type { Decisions, FieldDecision } from './types.js';
+import type { Decisions, SharedComponents } from './types.js';
 import { parseScopedFieldKey } from './scoped-field.js';
 
 export interface RelationshipConflict {
-  role: 'index_source' | 'value_source';
+  role: 'source' | 'reference';
   field: string;
   sources: string[];
 }
 
-function decisionFieldId(decision: FieldDecision | undefined): string | undefined {
-  if (!decision) return undefined;
-  return decision.matchesExisting ?? decision.componentId;
+export function detectRelationshipConflicts(_decisions: Decisions): RelationshipConflict[] {
+  // Duplicate source/reference declarations are allowed.
+  return [];
 }
 
-function sourceMaps(decisions: Decisions): {
-  indexSources: Map<string, string[]>;
-  valueSources: Map<string, string[]>;
-} {
-  const indexSources = new Map<string, string[]>();
-  const valueSources = new Map<string, string[]>();
-
-  for (const [decisionKey, decision] of Object.entries(decisions.fields)) {
-    const fieldId = decisionFieldId(decision);
-    if (!fieldId) continue;
-
-    if (decision.kind === 'index_source') {
-      const existing = indexSources.get(fieldId) ?? [];
-      existing.push(decisionKey);
-      indexSources.set(fieldId, existing);
-    } else if (decision.kind === 'value_source') {
-      const existing = valueSources.get(fieldId) ?? [];
-      existing.push(decisionKey);
-      valueSources.set(fieldId, existing);
-    }
-  }
-
-  return { indexSources, valueSources };
-}
-
-export function detectRelationshipConflicts(decisions: Decisions): RelationshipConflict[] {
-  const { indexSources, valueSources } = sourceMaps(decisions);
-  const conflicts: RelationshipConflict[] = [];
-
-  for (const [field, sources] of indexSources.entries()) {
-    if (sources.length > 1) {
-      conflicts.push({ role: 'index_source', field, sources });
-    }
-  }
-  for (const [field, sources] of valueSources.entries()) {
-    if (sources.length > 1) {
-      conflicts.push({ role: 'value_source', field, sources });
-    }
-  }
-
-  return conflicts.sort((a, b) => a.field.localeCompare(b.field) || a.role.localeCompare(b.role));
-}
-
-export function collectRelationshipWarnings(decisions: Decisions): string[] {
-  const { indexSources, valueSources } = sourceMaps(decisions);
+export function collectRelationshipWarnings(
+  decisions: Decisions,
+  components: SharedComponents,
+): string[] {
   const warnings: string[] = [];
+  const definedFields = new Set(Object.keys(components));
 
   for (const [decisionKey, decision] of Object.entries(decisions.fields)) {
-    const fieldId = decisionFieldId(decision);
-    if (!fieldId) continue;
+    if (decision.kind === 'scalar') continue;
 
-    if (decision.kind === 'fk' && !indexSources.has(fieldId)) {
+    if (decision.sourceFieldId && !definedFields.has(decision.sourceFieldId)) {
       warnings.push(
-        `${formatDecision(decisionKey)} references "${fieldId}" as fk, but no index_source is defined for that field.`,
+        `${formatDecision(decisionKey)} declares source field "${decision.sourceFieldId}" but it is not defined.`,
       );
-    } else if (decision.kind === 'foreign_value' && !valueSources.has(fieldId)) {
+    }
+
+    if (decision.referenceFieldId && !definedFields.has(decision.referenceFieldId)) {
       warnings.push(
-        `${formatDecision(decisionKey)} references "${fieldId}" as foreign_value, but no value_source is defined for that field.`,
+        `${formatDecision(decisionKey)} references "${decision.referenceFieldId}" but it is not defined.`,
       );
     }
   }

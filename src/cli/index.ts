@@ -8,7 +8,7 @@
  */
 
 import { program, InvalidOptionArgumentError } from 'commander';
-import { writeFile, mkdir, access, unlink } from 'node:fs/promises';
+import { writeFile, mkdir, access } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import {
@@ -21,6 +21,11 @@ import {
   copyHarToSession,
   samplesDir,
   decisionsPath,
+  suggestionsPath,
+  llmUsagePath,
+  promptLogPath,
+  llmLogPath,
+  pipelineLogPath,
   openApiDir,
 } from './session.js';
 import {
@@ -37,6 +42,8 @@ import {
   promptForSuspect,
   promptBatchOrInteractive,
   promptValidationFailure,
+  setPromptTraceLogger,
+  setPromptReloadHandler,
 } from './prompts.js';
 
 import { extractFromHar } from '../extract.js';
@@ -53,46 +60,75 @@ import { transformSchemas } from '../schema-transform.js';
 import { validateSchemas } from '../validate.js';
 import { emitOpenApi } from '../emit.js';
 import {
-  detectRelationshipConflicts,
   collectRelationshipWarnings,
 } from '../relationships.js';
+import {
+  loadSuggestionsState,
+  saveSuggestionsState,
+  saveSessionUsageSnapshot,
+  applyUsageToMetrics,
+} from '../llm/state.js';
+import { createSuggestionClient } from '../llm/suggest.js';
+import { appendJsonLine, timestampedEvent } from '../logging.js';
 
 import type {
   MethodCorpus,
   MethodSchema,
   Decisions,
   FieldDecision,
+  FieldKind,
   SharedComponents,
 } from '../types.js';
 import type { Suspect } from '../value-registry.js';
+import type {
+  SuggestionAdvice,
+  SuggestionCacheEntry,
+  SuggestionsState,
+} from '../llm/types.js';
 
 type ReviewMode = 'interactive' | 'batch' | 'auto-scalar';
 type ValidationFailureMode = 'prompt' | 'force';
+type SuggestionsMode = 'on' | 'off';
+type SuggestionsProvider = 'google';
 
 interface RunSessionOptions {
   reviewMode?: ReviewMode;
   assumeBatchEdited: boolean;
   validationFailureMode: ValidationFailureMode;
+  suggestionsMode: SuggestionsMode;
+  suggestionsProvider: SuggestionsProvider;
+  suggestionsModel: string;
+  suggestionsConfidenceThreshold: number;
+  suggestionsInputUsdPer1M?: number;
+  suggestionsOutputUsdPer1M?: number;
 }
 
 interface PipelineCommandOptions {
   reviewMode?: ReviewMode;
   assumeEdited?: boolean;
   forceOnValidationFailure?: boolean;
+  suggestions?: SuggestionsMode;
+  suggestionsProvider?: SuggestionsProvider;
+  suggestionsModel?: string;
+  suggestionsConfidenceThreshold?: number;
+  suggestionsInputUsdPer1M?: number;
+  suggestionsOutputUsdPer1M?: number;
 }
 
-function resolveDecisionComponentId(decision: FieldDecision | undefined): string | undefined {
-  if (!decision) return undefined;
-  return decision.matchesExisting ?? decision.componentId;
+function decisionFieldIds(decision: FieldDecision | undefined): string[] {
+  if (!decision) return [];
+  const out: string[] = [];
+  if (decision.sourceFieldId) out.push(decision.sourceFieldId);
+  if (decision.referenceFieldId) out.push(decision.referenceFieldId);
+  return out;
 }
 
 function isComponentStillReferenced(
   decisions: Decisions,
   componentId: string,
 ): boolean {
-  return Object.values(decisions.fields).some(
-    (decision) => resolveDecisionComponentId(decision) === componentId,
-  );
+  return Object.values(decisions.fields)
+    .some((decision) => decisionFieldIds(decision).includes(componentId));
 }
 
 function removeLastOccurrence(values: string[], target: string): void {
@@ -104,7 +140,135 @@ function removeLastOccurrence(values: string[], target: string): void {
   }
 }
 
-const RELATIONSHIP_CONFLICTS_FILE = 'relationship-conflicts.json';
+interface SuggestionFetchResult {
+  advice?: SuggestionAdvice;
+  error?: string;
+}
+
+const SUGGESTION_PREFETCH_AHEAD = 2;
+
+function compareSuspectsForPrompting(a: Suspect, b: Suspect): number {
+  return (
+    a.methodName.localeCompare(b.methodName)
+    || a.direction.localeCompare(b.direction)
+    || a.parentPath.localeCompare(b.parentPath)
+    || a.keyName.localeCompare(b.keyName)
+    || a.decisionKey.localeCompare(b.decisionKey)
+  );
+}
+
+function sortSuspectsForPrompting(suspects: Suspect[]): Suspect[] {
+  return [...suspects].sort(compareSuspectsForPrompting);
+}
+
+function responseSuspectsOnly(suspects: Suspect[]): Suspect[] {
+  return suspects.filter((suspect) => suspect.direction === 'response');
+}
+
+function suggestedKind(advice: SuggestionAdvice | undefined): FieldKind | undefined {
+  if (!advice) return undefined;
+  const hasSource = advice.source.recommended === 'yes';
+  const hasReference = advice.reference.recommended === 'yes';
+  if (hasSource && hasReference) return 'source_reference';
+  if (hasSource) return 'source';
+  if (hasReference) return 'reference';
+  return 'scalar';
+}
+
+function suggestionTarget(advice: SuggestionAdvice | undefined): string | undefined {
+  if (!advice) return undefined;
+  if (advice.source.recommended === 'yes') return advice.source.yesPayload.fieldId;
+  if (advice.reference.recommended === 'yes') return advice.reference.yesPayload.fieldId;
+  return undefined;
+}
+
+function parseModelFieldId(value: string | undefined): { modelName: string; fieldName: string } | null {
+  if (!value) return null;
+  const lastDot = value.lastIndexOf('.');
+  if (lastDot <= 0 || lastDot >= value.length - 1) return null;
+  const modelName = value.slice(0, lastDot).trim();
+  const fieldName = value.slice(lastDot + 1).trim();
+  if (!modelName || !fieldName) return null;
+  return { modelName, fieldName };
+}
+
+function inferPrimitiveTypes(values: Set<string | number | boolean>): string[] {
+  let hasString = false;
+  let hasNumber = false;
+  let hasInteger = true;
+  let hasBoolean = false;
+  for (const value of values) {
+    if (typeof value === 'string') hasString = true;
+    if (typeof value === 'boolean') hasBoolean = true;
+    if (typeof value === 'number') {
+      hasNumber = true;
+      if (!Number.isInteger(value)) hasInteger = false;
+    }
+  }
+  const out: string[] = [];
+  if (hasString) out.push('string');
+  if (hasNumber) out.push(hasInteger ? 'integer' : 'number');
+  if (hasBoolean) out.push('boolean');
+  return out;
+}
+
+function componentTypes(component: { baseType: string; baseTypes?: string[] }): string[] {
+  if (component.baseTypes && component.baseTypes.length > 0) {
+    return Array.from(new Set(component.baseTypes));
+  }
+  if (component.baseType && component.baseType !== 'mixed') return [component.baseType];
+  return [];
+}
+
+function hasTypeConflict(
+  existing: { baseType: string; baseTypes?: string[] },
+  inferred: string[],
+): boolean {
+  const existingSet = new Set(componentTypes(existing));
+  const inferredSet = new Set(inferred);
+  if (existingSet.size === 0 || inferredSet.size === 0) return false;
+  if (existingSet.size !== inferredSet.size) return true;
+  for (const t of existingSet) {
+    if (!inferredSet.has(t)) return true;
+  }
+  return false;
+}
+
+function kindFromPromptResult(result: {
+  kind?: FieldKind;
+  sourceFieldId?: string;
+  referenceFieldId?: string;
+}): FieldKind {
+  if (result.kind) return result.kind;
+  const hasSource = !!result.sourceFieldId;
+  const hasReference = !!result.referenceFieldId;
+  if (hasSource && hasReference) return 'source_reference';
+  if (hasSource) return 'source';
+  if (hasReference) return 'reference';
+  return 'scalar';
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => stableStringify(v)).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort((a, b) => a.localeCompare(b));
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(record[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function decisionsFingerprint(
+  decisions: Decisions,
+  components: SharedComponents,
+): string {
+  return stableStringify({
+    fields: decisions.fields,
+    components,
+  });
+}
 
 // ── Pipeline runner ─────────────────────────────────────────────────
 
@@ -113,25 +277,98 @@ async function runSession(
   options: RunSessionOptions = {
     assumeBatchEdited: false,
     validationFailureMode: 'prompt',
+    suggestionsMode: 'off',
+    suggestionsProvider: 'google',
+    suggestionsModel: 'gemini-2.5-flash-lite',
+    suggestionsConfidenceThreshold: 0.6,
   },
 ): Promise<void> {
   let progress = await loadProgress(sessionDir);
+  let decisions: Decisions = { fields: {} };
+  let components: SharedComponents = {};
+  let decisionsLoaded = false;
+  const pipelineLog = pipelineLogPath(sessionDir);
+  const promptsLog = promptLogPath(sessionDir);
+  const llmLog = llmLogPath(sessionDir);
+
+  const logPipeline = async (
+    event: string,
+    payload: Record<string, unknown> = {},
+  ): Promise<void> => {
+    await appendJsonLine(pipelineLog, timestampedEvent(event, payload));
+  };
+
+  const logLlm = async (
+    event: string,
+    payload: Record<string, unknown> = {},
+  ): Promise<void> => {
+    await appendJsonLine(llmLog, timestampedEvent(event, payload));
+  };
+
+  setPromptTraceLogger(async (event) => {
+    await appendJsonLine(promptsLog, {
+      timestamp: event.timestamp,
+      promptType: event.promptType,
+      context: event.context,
+      message: event.message,
+      response: event.response,
+      choices: event.choices,
+    });
+  });
+  const stopPromptTracing = (): void => {
+    setPromptTraceLogger(null);
+  };
+
+  const reloadDecisionsFromDisk = async (reason: string): Promise<void> => {
+    if (!decisionsLoaded) {
+      await logPipeline('decisions.reload.skip', { reason, because: 'not_loaded_yet' });
+      return;
+    }
+    const reloaded = await loadDecisions(decisionsPath(sessionDir));
+    decisions = reloaded.decisions;
+    components = reloaded.components;
+    await logPipeline('decisions.reload', {
+      reason,
+      decided: Object.keys(decisions.fields).length,
+      components: Object.keys(components).length,
+    });
+    console.log('\n  Reloaded decisions.json. Restarting current prompt.\n');
+  };
+
+  setPromptReloadHandler(async () => {
+    await reloadDecisionsFromDisk('ctrl+r');
+  });
+
+  await logPipeline('session.start', {
+    sessionDir,
+    step: progress.step,
+    options,
+  });
 
   console.log(`\nSession: ${sessionDir}`);
   console.log(`Current step: ${progress.step}\n`);
+  await logPipeline('session.state', { step: progress.step });
 
   // ── Step 1: Recording ──
   if (progress.step === 'recording') {
+    await logPipeline('step.recording.start');
     await runRecording(sessionDir);
     progress = await updateStep(sessionDir, 'extracted');
+    await logPipeline('step.recording.done', { nextStep: progress.step });
   }
 
   // ── Step 2: Extract + Normalize ──
   let corpora: MethodCorpus[] = [];
   if (progress.step === 'extracted' || needsExtraction(progress.step)) {
+    await logPipeline('step.extract.start');
     corpora = await runExtract(sessionDir);
+    await logPipeline('step.extract.done', {
+      methods: corpora.length,
+      samples: corpora.reduce((s, c) => s + c.samples.length, 0),
+    });
     if (progress.step === 'extracted') {
       progress = await updateStep(sessionDir, 'inferred');
+      await logPipeline('step.transition', { nextStep: progress.step });
     }
   } else {
     corpora = await runExtract(sessionDir);
@@ -140,9 +377,12 @@ async function runSession(
   // ── Step 3: Infer ──
   let schemas: MethodSchema[] = [];
   if (progress.step === 'inferred' || needsInference(progress.step)) {
+    await logPipeline('step.infer.start');
     schemas = await runInfer(corpora);
+    await logPipeline('step.infer.done', { methods: schemas.length });
     if (progress.step === 'inferred') {
       progress = await updateStep(sessionDir, 'collecting_values');
+      await logPipeline('step.transition', { nextStep: progress.step });
     }
   }
 
@@ -150,84 +390,367 @@ async function runSession(
   let suspects: Suspect[] = [];
   if (progress.step === 'collecting_values') {
     const registry = buildValueRegistry(corpora);
-    suspects = detectSuspects(registry);
-    console.log(`\n  ${suspects.length} suspect fields detected\n`);
+    suspects = sortSuspectsForPrompting(responseSuspectsOnly(detectSuspects(registry)));
+    console.log(`\n  ${suspects.length} response-side suspect fields detected\n`);
+    await logPipeline('step.collect_values.done', { suspects: suspects.length });
     progress = await updateStep(sessionDir, 'prompting');
+    await logPipeline('step.transition', { nextStep: progress.step });
   }
 
   // ── Step 5: Prompt User ──
-  let { decisions, components } = await loadDecisions(decisionsPath(sessionDir));
+  {
+    const loaded = await loadDecisions(decisionsPath(sessionDir));
+    decisions = loaded.decisions;
+    components = loaded.components;
+    decisionsLoaded = true;
+  }
 
   if (progress.step === 'prompting') {
     if (suspects.length === 0) {
       const registry = buildValueRegistry(corpora);
-      suspects = detectSuspects(registry);
+      suspects = sortSuspectsForPrompting(responseSuspectsOnly(detectSuspects(registry)));
     }
 
     const startIndex = progress.nextPromptIndex ?? 0;
-    const undecided = suspects.filter((s) => !(s.decisionKey in decisions.fields));
+    const undecided = sortSuspectsForPrompting(
+      suspects.filter((s) => !(s.decisionKey in decisions.fields)),
+    );
 
     if (undecided.length > 0) {
       const mode = options.reviewMode ?? await promptBatchOrInteractive();
+      await logPipeline('prompting.mode', { mode, undecided: undecided.length });
 
       if (mode === 'interactive') {
+        console.log('  Tip: Press Ctrl+R at any prompt to reload decisions.json and restart that prompt.\n');
+        let suggestionState: SuggestionsState | null = null;
+        let suggestionClient: ReturnType<typeof createSuggestionClient> | null = null;
+        const pendingSuggestions = new Map<string, Promise<SuggestionFetchResult>>();
+        const suggestionFilePath = suggestionsPath(sessionDir);
+        const usageFilePath = llmUsagePath(sessionDir);
+        const suggestionPricing = {
+          inputUsdPer1M: options.suggestionsInputUsdPer1M,
+          outputUsdPer1M: options.suggestionsOutputUsdPer1M,
+        };
+
+        if (options.suggestionsMode === 'on') {
+          suggestionState = await loadSuggestionsState(
+            suggestionFilePath,
+            options.suggestionsModel,
+            options.suggestionsConfidenceThreshold,
+          );
+          suggestionClient = createSuggestionClient({
+            provider: options.suggestionsProvider,
+            model: options.suggestionsModel,
+          });
+
+          const ready = suggestionClient.isReady();
+          if (!ready.ok) {
+            suggestionClient = null;
+            console.log(`  LLM suggestions unavailable (${ready.reason}). Continuing manual mode.\n`);
+          } else {
+            console.log(
+              `  LLM suggestions enabled (${options.suggestionsProvider}:${options.suggestionsModel})\n`,
+            );
+          }
+        }
+
+        const persistSuggestionState = async (): Promise<void> => {
+          if (!suggestionState) return;
+          await saveSuggestionsState(suggestionFilePath, suggestionState);
+          await saveSessionUsageSnapshot(usageFilePath, suggestionState, suggestionPricing);
+        };
+
+        const fetchSuggestion = async (suspect: Suspect): Promise<SuggestionFetchResult> => {
+          if (!suggestionState || !suggestionClient) return {};
+          const cached = suggestionState.suggestions[suspect.decisionKey];
+          if (cached) {
+            suggestionState.metrics.cacheHits++;
+            await persistSuggestionState();
+            const cachedKind = suggestedKind(cached.advice);
+            await logLlm('suggestion.cache_hit', {
+              decisionKey: suspect.decisionKey,
+              kind: cachedKind,
+            });
+            return { advice: cached.advice };
+          }
+
+          const pending = pendingSuggestions.get(suspect.decisionKey);
+          if (pending) return pending;
+
+          // Reserve the key immediately so concurrent callers share one in-flight request.
+          const promise = (async (): Promise<SuggestionFetchResult> => {
+            suggestionState!.metrics.attemptedCalls++;
+            await logLlm('suggestion.request', {
+              decisionKey: suspect.decisionKey,
+              methodName: suspect.methodName,
+              direction: suspect.direction,
+              parentPath: suspect.parentPath,
+              keyName: suspect.keyName,
+            });
+            const result = await suggestionClient!.suggest({
+              suspect,
+              components,
+              decisions,
+              suspects,
+            });
+
+            if (result.advice) {
+              const entry: SuggestionCacheEntry = {
+                model: options.suggestionsModel,
+                createdAt: new Date().toISOString(),
+                latencyMs: result.latencyMs,
+                advice: result.advice,
+                usage: result.usage,
+              };
+              suggestionState!.suggestions[suspect.decisionKey] = entry;
+              suggestionState!.metrics.completedCalls++;
+              applyUsageToMetrics(suggestionState!.metrics, result.usage, suggestionPricing);
+              await logLlm('suggestion.response', {
+                decisionKey: suspect.decisionKey,
+                prompt: result.prompt,
+                response: result.rawResponse ?? result.advice,
+                advice: result.advice,
+                usage: result.usage,
+                latencyMs: result.latencyMs,
+                runningMetrics: suggestionState!.metrics,
+              });
+            } else {
+              suggestionState!.metrics.failedCalls++;
+              await logLlm('suggestion.error', {
+                decisionKey: suspect.decisionKey,
+                prompt: result.prompt,
+                error: result.error,
+                latencyMs: result.latencyMs,
+                usage: result.usage,
+                runningMetrics: suggestionState!.metrics,
+              });
+            }
+
+            await persistSuggestionState();
+            return { advice: result.advice, error: result.error };
+          })();
+
+          pendingSuggestions.set(suspect.decisionKey, promise);
+          try {
+            return await promise;
+          } finally {
+            pendingSuggestions.delete(suspect.decisionKey);
+          }
+        };
+
+        const prefetchSuggestion = (suspect: Suspect | undefined): void => {
+          if (!suspect || !suggestionClient || !suggestionState) return;
+          if (suggestionState.suggestions[suspect.decisionKey]) return;
+          if (pendingSuggestions.has(suspect.decisionKey)) return;
+          void fetchSuggestion(suspect);
+        };
+
+        const prefetchUpcomingSuggestions = (
+          undecidedList: Suspect[],
+          currentIndex: number,
+        ): void => {
+          for (let offset = 1; offset <= SUGGESTION_PREFETCH_AHEAD; offset++) {
+            prefetchSuggestion(undecidedList[currentIndex + offset]);
+          }
+        };
+
         let i = startIndex;
-        while (i < undecided.length) {
-          const suspect = undecided[i]!;
-          const result = await promptForSuspect(suspect, components, i, undecided.length);
+        let decisionsFileHash = decisionsFingerprint(decisions, components);
+        {
+          const initialUndecided = sortSuspectsForPrompting(
+            suspects.filter((s) => !(s.decisionKey in decisions.fields)),
+          );
+          prefetchSuggestion(initialUndecided[i]);
+          prefetchUpcomingSuggestions(initialUndecided, i);
+        }
+        while (true) {
+          const latestFile = await loadDecisions(decisionsPath(sessionDir));
+          const latestHash = decisionsFingerprint(latestFile.decisions, latestFile.components);
+          if (latestHash !== decisionsFileHash) {
+            decisions = latestFile.decisions;
+            components = latestFile.components;
+            decisionsFileHash = latestHash;
+            console.log('  decisions.json changed on disk. Reloaded and restarting current field.\n');
+            await logPipeline('decisions.reload_from_disk', {
+              promptIndex: i,
+              decided: Object.keys(decisions.fields).length,
+              components: Object.keys(components).length,
+            });
+          }
+
+          const undecidedNow = sortSuspectsForPrompting(
+            suspects.filter((s) => !(s.decisionKey in decisions.fields)),
+          );
+          if (i >= undecidedNow.length) break;
+          const suspect = undecidedNow[i]!;
+          const fetchedSuggestion = await fetchSuggestion(suspect);
+          const shownSuggestion = fetchedSuggestion.advice;
+          const suggestedKindForField = suggestedKind(shownSuggestion);
+          if (shownSuggestion && suggestionState) {
+            suggestionState.metrics.suggestionsShown++;
+            await persistSuggestionState();
+          }
+
+          prefetchUpcomingSuggestions(undecidedNow, i);
+
+          const promptStartedAt = Date.now();
+          const result = await promptForSuspect(
+            suspect,
+            components,
+            i,
+            undecided.length,
+            shownSuggestion,
+          );
+          const decisionDurationMs = Date.now() - promptStartedAt;
+
+          if (result.action === 'apply' && suggestionState) {
+            suggestionState.metrics.decisionCount++;
+            suggestionState.metrics.decisionTimeMsTotal += decisionDurationMs;
+            if (shownSuggestion) {
+              suggestionState.metrics.decisionsWithSuggestion++;
+              const selectedKind = kindFromPromptResult(result);
+              if (selectedKind === suggestedKindForField) {
+                suggestionState.metrics.acceptedKind++;
+              }
+              const suggestedSource = shownSuggestion.source.recommended === 'yes'
+                ? shownSuggestion.source.yesPayload.fieldId
+                : undefined;
+              const suggestedReference = shownSuggestion.reference.recommended === 'yes'
+                ? shownSuggestion.reference.yesPayload.fieldId
+                : undefined;
+              if (
+                selectedKind === suggestedKindForField
+                && result.sourceFieldId === suggestedSource
+                && result.referenceFieldId === suggestedReference
+              ) {
+                suggestionState.metrics.acceptedExact++;
+              }
+            }
+            await persistSuggestionState();
+          }
 
           if (result.action === 'back') {
-            if (i === 0) {
-              console.log('  Already at the first field. Nothing to undo.\n');
+            const previousKey = progress.undoStack[progress.undoStack.length - 1];
+            if (!previousKey) {
+              console.log('  Nothing to undo.\n');
               continue;
             }
 
-            const previousIndex = i - 1;
-            const previousSuspect = undecided[previousIndex]!;
-            const previousKey = previousSuspect.decisionKey;
             const previousDecision = decisions.fields[previousKey];
-
             if (!previousDecision) {
-              console.log(`  No saved decision found for previous field (${previousSuspect.keyName}).\n`);
-              i = previousIndex;
+              // Stale undo entry (e.g. manual edits on disk). Drop it and continue.
+              removeLastOccurrence(progress.undoStack, previousKey);
+              await saveProgress(sessionDir, progress);
+              console.log('  Previous undo entry no longer exists in decisions; skipped.\n');
               continue;
             }
 
-            const componentId = resolveDecisionComponentId(previousDecision);
+            const componentIds = decisionFieldIds(previousDecision);
             removeFieldDecision(decisions, previousKey);
 
-            if (
-              componentId &&
-              previousDecision.componentId &&
-              !previousDecision.matchesExisting &&
-              !isComponentStillReferenced(decisions, componentId)
-            ) {
-              removeComponent(components, componentId);
+            for (const componentId of componentIds) {
+              if (!isComponentStillReferenced(decisions, componentId)) {
+                removeComponent(components, componentId);
+              }
             }
 
             removeLastOccurrence(progress.undoStack, previousKey);
-            progress.nextPromptIndex = previousIndex;
-            await saveProgress(sessionDir, progress);
             await saveDecisions(decisionsPath(sessionDir), decisions, components);
+            decisionsFileHash = decisionsFingerprint(decisions, components);
 
-            console.log(
-              `  Undid previous decision. Returning to ${previousSuspect.methodName} [${previousSuspect.direction}] ${previousSuspect.keyName}.\n`,
+            const undecidedAfterUndo = sortSuspectsForPrompting(
+              suspects.filter((s) => !(s.decisionKey in decisions.fields)),
             );
+            const restartIndex = undecidedAfterUndo.findIndex((s) => s.decisionKey === previousKey);
+            i = restartIndex >= 0 ? restartIndex : Math.max(0, i - 1);
+            progress.nextPromptIndex = i;
+            await saveProgress(sessionDir, progress);
 
-            i = previousIndex;
+            await logPipeline('decision.undo', {
+              decisionKey: previousKey,
+              promptIndex: i,
+            });
+
+            const currentSuspect = undecidedAfterUndo[i];
+            console.log(
+              currentSuspect
+                ? `  Undid previous decision. Returning to ${currentSuspect.methodName} [${currentSuspect.direction}] ${currentSuspect.keyName}.\n`
+                : '  Undid previous decision.\n',
+            );
             continue;
           }
 
+          const selectedKind = kindFromPromptResult(result);
+          const sourceRef = parseModelFieldId(result.sourceFieldId);
+          const referenceRef = parseModelFieldId(result.referenceFieldId);
+
+          if (result.sourceFieldId && !sourceRef) {
+            console.log('  Source field target must be in "Model.Field" format. Restarting this field.\n');
+            continue;
+          }
+          if (result.referenceFieldId && !referenceRef) {
+            console.log('  Reference target must be in "Model.Field" format. Restarting this field.\n');
+            continue;
+          }
+
+          if (result.sourceFieldId) {
+            const existingComponent = components[result.sourceFieldId];
+            if (existingComponent) {
+              const inferredTypes = inferPrimitiveTypes(suspect.entry.values);
+              if (hasTypeConflict(existingComponent, inferredTypes)) {
+                console.error(
+                  `\nType conflict on ${result.sourceFieldId}: existing ${componentTypes(existingComponent).join('|') || existingComponent.baseType}, `
+                  + `current ${inferredTypes.join('|') || 'unknown'}.`,
+                );
+                const ready = await promptContinue('Edit decisions.json to resolve this type conflict, then continue?');
+                if (!ready) {
+                  console.log('  Session saved. Resume later to continue.\n');
+                  await logPipeline('session.pause', { reason: 'type_conflict_unresolved' });
+                  stopPromptTracing();
+                  setPromptReloadHandler(null);
+                  return;
+                }
+                const reloaded = await loadDecisions(decisionsPath(sessionDir));
+                decisions = reloaded.decisions;
+                components = reloaded.components;
+                decisionsFileHash = decisionsFingerprint(decisions, components);
+                continue;
+              }
+            }
+          }
+
+          if (result.referenceFieldId && !(result.referenceFieldId in components)) {
+            console.warn(
+              `  Warning: ${suspect.methodName} [${suspect.direction}] ${suspect.parentPath}.${suspect.keyName} `
+              + `references undefined model field "${result.referenceFieldId}".`,
+            );
+          }
+
           setFieldDecision(decisions, suspect.decisionKey, {
-            kind: result.kind!,
-            componentId: result.componentId,
-            matchesExisting: result.matchesExisting,
+            kind: selectedKind,
+            sourceFieldId: result.sourceFieldId,
+            referenceFieldId: result.referenceFieldId,
+            modelName: sourceRef?.modelName,
+            fieldName: sourceRef?.fieldName,
+            referenceModelName: referenceRef?.modelName,
+            referenceFieldName: referenceRef?.fieldName,
           });
 
           progress.undoStack.push(suspect.decisionKey);
           progress.nextPromptIndex = i + 1;
           await saveProgress(sessionDir, progress);
           await saveDecisions(decisionsPath(sessionDir), decisions, components);
+          decisionsFileHash = decisionsFingerprint(decisions, components);
+          await logPipeline('decision.apply', {
+            decisionKey: suspect.decisionKey,
+            kind: selectedKind,
+            sourceFieldId: result.sourceFieldId,
+            referenceFieldId: result.referenceFieldId,
+            promptIndex: i,
+            suggestionUsed: !!shownSuggestion,
+            suggestedKind: suggestedKindForField,
+            suggestedTarget: suggestionTarget(shownSuggestion),
+          });
           i++;
         }
       } else if (mode === 'auto-scalar') {
@@ -237,6 +760,7 @@ async function runSession(
         progress.nextPromptIndex = undecided.length;
         await saveProgress(sessionDir, progress);
         await saveDecisions(decisionsPath(sessionDir), decisions, components);
+        await logPipeline('decision.auto_scalar', { count: undecided.length });
       } else {
         // Batch mode: pre-populate fields with scalar default + values reference, save, let user edit
         for (const s of undecided) {
@@ -269,12 +793,15 @@ async function runSession(
         await saveDecisions(decisionsPath(sessionDir), decisions, components, suspectReference);
         console.log(`\n  Decisions file: ${decisionsPath(sessionDir)}`);
         console.log('  Pre-filled with scalar defaults + _suspectValues for context.');
-        console.log('  Edit each field: choose enum/fk/foreign_value/index_source/value_source and set componentId.');
+        console.log('  Edit each field: choose scalar/source/reference/source_reference and optional sourceFieldId/referenceFieldId.');
         console.log('  Then resume this session to continue.\n');
 
         const ready = options.assumeBatchEdited || await promptContinue('Have you finished editing decisions.json?');
         if (!ready) {
           console.log('  Session saved. Resume later to continue.\n');
+          await logPipeline('session.pause', { reason: 'batch_waiting_for_edit' });
+          stopPromptTracing();
+          setPromptReloadHandler(null);
           return;
         }
 
@@ -286,7 +813,12 @@ async function runSession(
     }
 
     await saveDecisions(decisionsPath(sessionDir), decisions, components);
+    await logPipeline('step.prompting.done', {
+      decided: Object.keys(decisions.fields).length,
+      components: Object.keys(components).length,
+    });
     progress = await updateStep(sessionDir, 'transformed');
+    await logPipeline('step.transition', { nextStep: progress.step });
   }
 
   // ── Step 6: Transform ──
@@ -296,51 +828,10 @@ async function runSession(
     decisions = reloaded.decisions;
     components = reloaded.components;
 
-    // Hard gate: each field definition can have at most one index_source and one value_source.
-    // Conflicts must be resolved manually before transform/emit can continue.
-    const conflictsPath = join(sessionDir, RELATIONSHIP_CONFLICTS_FILE);
-    let conflicts = detectRelationshipConflicts(decisions);
-    while (conflicts.length > 0) {
-      await writeFile(
-        conflictsPath,
-        JSON.stringify({
-          message: 'Resolve duplicate source declarations. Keep exactly one source per field per role.',
-          conflicts,
-        }, null, 2),
-        'utf-8',
-      );
-
-      console.error(`\nRelationship conflicts detected (${conflicts.length}).`);
-      console.error(`Resolve: ${conflictsPath}`);
-      console.error(`Then edit: ${decisionsPath(sessionDir)}\n`);
-
-      if (options.assumeBatchEdited) {
-        process.exitCode = 1;
-        return;
-      }
-
-      const ready = await promptContinue('Done resolving relationship conflicts?');
-      if (!ready) {
-        console.log('  Session saved. Resume later to continue.\n');
-        return;
-      }
-
-      const afterEdit = await loadDecisions(decisionsPath(sessionDir));
-      decisions = afterEdit.decisions;
-      components = afterEdit.components;
-      conflicts = detectRelationshipConflicts(decisions);
-    }
-
-    // Conflicts resolved: cleanup temporary conflict file if present.
-    try {
-      await unlink(conflictsPath);
-    } catch {
-      // no-op
-    }
-
-    const relationshipWarnings = collectRelationshipWarnings(decisions);
+    const relationshipWarnings = collectRelationshipWarnings(decisions, components);
     progress.relationshipWarnings = relationshipWarnings;
     await saveProgress(sessionDir, progress);
+    await logPipeline('relationship.warnings', { count: relationshipWarnings.length });
 
     // Re-extract and re-infer if needed (we need corpora and schemas)
     if (corpora.length === 0) corpora = await runExtract(sessionDir);
@@ -351,6 +842,11 @@ async function runSession(
     // ── Step 7: Validate ──
     console.log('\nValidating (every sample must pass)...');
     const validation = validateSchemas(corpora, transformedSchemas, components);
+    await logPipeline('validation.summary', {
+      allPass: validation.allPass,
+      methods: validation.results.length,
+      failures: validation.failureRecords.length,
+    });
 
     for (const r of validation.results) {
       const fails = r.requestFailures.length + r.responseFailures.length;
@@ -376,15 +872,12 @@ async function runSession(
             const lastKey = progress.undoStack.pop();
             if (lastKey) {
               const dec = decisions.fields[lastKey];
-              const componentId = resolveDecisionComponentId(dec);
+              const componentIds = decisionFieldIds(dec);
               removeFieldDecision(decisions, lastKey);
-              if (
-                componentId &&
-                dec?.componentId &&
-                !dec.matchesExisting &&
-                !isComponentStillReferenced(decisions, componentId)
-              ) {
-                removeComponent(components, componentId);
+              for (const componentId of componentIds) {
+                if (!isComponentStillReferenced(decisions, componentId)) {
+                  removeComponent(components, componentId);
+                }
               }
               await saveDecisions(decisionsPath(sessionDir), decisions, components);
               await saveProgress(sessionDir, progress);
@@ -458,6 +951,7 @@ async function runSession(
     }
 
     progress = await updateStep(sessionDir, 'validated');
+    await logPipeline('step.transition', { nextStep: progress.step });
   }
 
   // ── Step 8: Emit ──
@@ -476,13 +970,15 @@ async function runSession(
     const { rootPath, fileCount } = await emitOpenApi(schemas, components, outDir);
     console.log(`  Root: ${rootPath}`);
     console.log(`  Files written: ${fileCount}\n`);
+    await logPipeline('emit.done', { rootPath, fileCount });
 
     progress = await updateStep(sessionDir, 'emitted');
+    await logPipeline('step.transition', { nextStep: progress.step });
   }
 
   {
     const finalDecisions = await loadDecisions(decisionsPath(sessionDir));
-    const warnings = collectRelationshipWarnings(finalDecisions.decisions);
+    const warnings = collectRelationshipWarnings(finalDecisions.decisions, finalDecisions.components);
     progress = await loadProgress(sessionDir);
     progress.relationshipWarnings = warnings;
     await saveProgress(sessionDir, progress);
@@ -497,12 +993,56 @@ async function runSession(
     console.log();
   }
 
+  if (options.suggestionsMode === 'on') {
+    const state = await loadSuggestionsState(
+      suggestionsPath(sessionDir),
+      options.suggestionsModel,
+      options.suggestionsConfidenceThreshold,
+    );
+    const metrics = state.metrics;
+    const acceptanceRate = metrics.decisionsWithSuggestion > 0
+      ? (metrics.acceptedKind / metrics.decisionsWithSuggestion) * 100
+      : 0;
+    const avgDecisionMs = metrics.decisionCount > 0
+      ? metrics.decisionTimeMsTotal / metrics.decisionCount
+      : 0;
+
+    console.log('Suggestion metrics:');
+    console.log(`  Calls: ${metrics.completedCalls}/${metrics.attemptedCalls} (cache hits: ${metrics.cacheHits}, failed: ${metrics.failedCalls})`);
+    console.log(`  Tokens: in ${metrics.inputTokens}, out ${metrics.outputTokens}, total ${metrics.totalTokens}`);
+    console.log(`  Estimated cost (USD): ${metrics.estimatedCostUsd.toFixed(6)}`);
+    console.log(`  Acceptance (kind match): ${acceptanceRate.toFixed(1)}%`);
+    console.log(`  Avg decision time: ${avgDecisionMs.toFixed(0)} ms`);
+    console.log();
+    await logPipeline('suggestions.metrics', {
+      attemptedCalls: metrics.attemptedCalls,
+      completedCalls: metrics.completedCalls,
+      failedCalls: metrics.failedCalls,
+      cacheHits: metrics.cacheHits,
+      suggestionsShown: metrics.suggestionsShown,
+      decisionCount: metrics.decisionCount,
+      decisionsWithSuggestion: metrics.decisionsWithSuggestion,
+      acceptedKind: metrics.acceptedKind,
+      acceptedExact: metrics.acceptedExact,
+      inputTokens: metrics.inputTokens,
+      outputTokens: metrics.outputTokens,
+      totalTokens: metrics.totalTokens,
+      estimatedCostUsd: metrics.estimatedCostUsd,
+    });
+  }
+
   // ── Done ──
   console.log('═══════════════════════════════════════════');
   console.log(`  Session   : ${sessionDir}`);
   console.log(`  Status    : ${latestProgress.step}`);
   console.log(`  Output    : ${openApiDir(sessionDir)}/`);
   console.log('═══════════════════════════════════════════\n');
+  await logPipeline('session.complete', {
+    status: latestProgress.step,
+    outputDir: `${openApiDir(sessionDir)}/`,
+  });
+  stopPromptTracing();
+  setPromptReloadHandler(null);
 }
 
 // ── Sub-steps ───────────────────────────────────────────────────────
@@ -598,6 +1138,28 @@ function parseStartAction(value: string): 'new' | 'resume' {
   throw new InvalidOptionArgumentError('action must be one of: new, resume');
 }
 
+function parseSuggestionsMode(value: string): SuggestionsMode {
+  if (value === 'on' || value === 'off') return value;
+  throw new InvalidOptionArgumentError('suggestions must be one of: on, off');
+}
+
+function parseSuggestionsProvider(value: string): SuggestionsProvider {
+  if (value === 'google') return value;
+  throw new InvalidOptionArgumentError('suggestions-provider must be one of: google');
+}
+
+function parseConfidenceThreshold(value: string): number {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 1) return parsed;
+  throw new InvalidOptionArgumentError('suggestions-confidence-threshold must be between 0 and 1');
+}
+
+function parseUsdPer1M(value: string): number {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  throw new InvalidOptionArgumentError('cost-per-1m options must be non-negative numbers');
+}
+
 function configureSessionsDir(sessionsDir?: string): void {
   if (!sessionsDir) return;
   process.env.SOBRANIE_SESSIONS_DIR = resolve(process.cwd(), sessionsDir);
@@ -608,6 +1170,12 @@ function toRunSessionOptions(options: PipelineCommandOptions): RunSessionOptions
     reviewMode: options.reviewMode,
     assumeBatchEdited: options.assumeEdited ?? false,
     validationFailureMode: options.forceOnValidationFailure ? 'force' : 'prompt',
+    suggestionsMode: options.suggestions ?? 'off',
+    suggestionsProvider: options.suggestionsProvider ?? 'google',
+    suggestionsModel: options.suggestionsModel ?? 'gemini-2.5-flash-lite',
+    suggestionsConfidenceThreshold: options.suggestionsConfidenceThreshold ?? 0.6,
+    suggestionsInputUsdPer1M: options.suggestionsInputUsdPer1M,
+    suggestionsOutputUsdPer1M: options.suggestionsOutputUsdPer1M,
   };
 }
 
@@ -648,6 +1216,39 @@ function addPipelineOptions<T extends import('commander').Command>(command: T): 
       '--force-on-validation-failure',
       'If validation fails, force emit without opening the interactive retry menu',
       false,
+    )
+    .option(
+      '--suggestions <mode>',
+      'LLM suggestions mode: on | off',
+      parseSuggestionsMode,
+      'off',
+    )
+    .option(
+      '--suggestions-provider <provider>',
+      'Suggestion provider (currently: google)',
+      parseSuggestionsProvider,
+      'google',
+    )
+    .option(
+      '--suggestions-model <model>',
+      'Suggestion model id',
+      'gemini-2.5-flash-lite',
+    )
+    .option(
+      '--suggestions-confidence-threshold <n>',
+      'Legacy option (ignored with rank-based suggestions)',
+      parseConfidenceThreshold,
+      0.6,
+    )
+    .option(
+      '--suggestions-input-usd-per-1m <usd>',
+      'Estimated input token cost per 1M tokens (for metrics)',
+      parseUsdPer1M,
+    )
+    .option(
+      '--suggestions-output-usd-per-1m <usd>',
+      'Estimated output token cost per 1M tokens (for metrics)',
+      parseUsdPer1M,
     );
 }
 
