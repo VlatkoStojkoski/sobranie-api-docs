@@ -27,6 +27,7 @@ import {
   llmLogPath,
   pipelineLogPath,
   openApiDir,
+  setSessionsDirOverride,
 } from './session.js';
 import {
   checkDevProxy,
@@ -1161,8 +1162,9 @@ function parseUsdPer1M(value: string): number {
 }
 
 function configureSessionsDir(sessionsDir?: string): void {
-  if (!sessionsDir) return;
-  process.env.SOBRANIE_SESSIONS_DIR = resolve(process.cwd(), sessionsDir);
+  setSessionsDirOverride(
+    sessionsDir ? resolve(process.cwd(), sessionsDir) : undefined,
+  );
 }
 
 function toRunSessionOptions(options: PipelineCommandOptions): RunSessionOptions {

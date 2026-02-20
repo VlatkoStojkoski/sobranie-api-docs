@@ -6,12 +6,18 @@
 import { mkdir, readdir, readFile, writeFile, copyFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { SessionProgress, SessionStep } from '../types.js';
+import { env } from '../env.js';
 
 const DEFAULT_SESSIONS_DIR = 'sessions';
 const DEVPROXY_CONFIG = 'devproxyrc.json';
+let sessionsDirOverride: string | undefined;
 
 function getSessionsDir(): string {
-  return process.env.SOBRANIE_SESSIONS_DIR ?? DEFAULT_SESSIONS_DIR;
+  return sessionsDirOverride ?? env.SOBRANIE_SESSIONS_DIR ?? DEFAULT_SESSIONS_DIR;
+}
+
+export function setSessionsDirOverride(sessionsDir?: string): void {
+  sessionsDirOverride = sessionsDir;
 }
 
 // ── Create ──────────────────────────────────────────────────────────

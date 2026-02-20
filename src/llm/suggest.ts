@@ -12,6 +12,7 @@ import type {
 } from './prompt-contract.js';
 import { promptSuggestionWithGoogleGenAI } from './prompt-google-genai.js';
 import { promptSuggestionWithVercel } from './prompt-vercel.js';
+import { env } from '../env.js';
 
 export interface SuggestionRequest {
   suspect: Suspect;
@@ -121,7 +122,7 @@ export function createSuggestionClient(
     default:
       return new GoogleSuggestionClient({
         model: options.model,
-        apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+        apiKey: env.GOOGLE_GENERATIVE_AI_API_KEY,
         backend: resolvePromptBackend(options.backend),
       });
   }
@@ -132,7 +133,7 @@ function resolvePromptBackend(
 ): SuggestionPromptBackend {
   if (requested) return requested;
 
-  const envValue = process.env.SUGGESTIONS_PROMPT_BACKEND?.trim().toLowerCase();
+  const envValue = env.SUGGESTIONS_PROMPT_BACKEND?.trim().toLowerCase();
   if (envValue === 'vercel') return 'vercel';
   if (envValue === 'google_genai' || envValue === 'google-genai') {
     return 'google_genai';

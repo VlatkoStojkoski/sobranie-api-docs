@@ -21,6 +21,7 @@ import {
   samplesDir,
   decisionsPath,
   openApiDir,
+  setSessionsDirOverride,
 } from '../src/cli/session.js';
 
 const FIXTURE_HAR = 'test/fixtures/sample.har';
@@ -32,8 +33,7 @@ function delay(ms: number): Promise<void> {
 async function main(): Promise<void> {
   const base = await mkdtemp(join(tmpdir(), 'session-test-'));
   const sessionsRoot = join(base, 'sessions-root');
-  const originalSessionsDir = process.env.SOBRANIE_SESSIONS_DIR;
-  process.env.SOBRANIE_SESSIONS_DIR = sessionsRoot;
+  setSessionsDirOverride(sessionsRoot);
 
   try {
     const first = await createSession();
@@ -94,11 +94,7 @@ async function main(): Promise<void> {
 
     console.log('PASS test-session.ts');
   } finally {
-    if (originalSessionsDir === undefined) {
-      delete process.env.SOBRANIE_SESSIONS_DIR;
-    } else {
-      process.env.SOBRANIE_SESSIONS_DIR = originalSessionsDir;
-    }
+    setSessionsDirOverride(undefined);
     await rm(base, { recursive: true, force: true });
   }
 }

@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
-import { createSuggestionClient } from '../src/llm/suggest.js';
 import { makeScopedFieldKey } from '../src/scoped-field.js';
 import type { Decisions, SharedComponents, ValueEntry } from '../src/types.js';
 import type { Suspect } from '../src/value-registry.js';
 
 async function main(): Promise<void> {
   await loadDotEnvIfPresent();
+  const { createSuggestionClient } = await import('../src/llm/suggest.js');
 
   const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY?.trim();
   if (!apiKey) {
