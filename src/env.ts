@@ -1,5 +1,8 @@
 import { createEnv } from '@t3-oss/env-core';
+import { config as loadDotEnv } from 'dotenv';
 import { z } from 'zod';
+
+loadDotEnv();
 
 const envSchema = createEnv({
   server: {
@@ -14,4 +17,3 @@ const envSchema = createEnv({
 });
 
 export const env = envSchema;
-
