@@ -137,8 +137,8 @@ function binaryStepSchema(payloads: {
       recommended: { type: Type.STRING, enum: ['yes', 'no'] },
       rankedChoices: {
         type: Type.ARRAY,
-        minItems: '2',
-        maxItems: '2',
+        minItems: 2,
+        maxItems: 2,
         items: {
           type: Type.OBJECT,
           required: ['choice', 'rank', 'reason'],

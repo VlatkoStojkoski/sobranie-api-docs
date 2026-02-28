@@ -150,6 +150,8 @@ function buildPrompt(input: SuggestionRequest): string {
     suspect,
     input.suspects ?? [],
   );
+  const keyAnalysis = analyzeKeyNameSemantics(suspect.keyName, siblingFields);
+  const entityContext = inferEntityContext(suspect);
 
   const overlapping = findOverlappingComponents(components, values).slice(0, 10).map((m) => ({
     id: m.id,
@@ -160,6 +162,13 @@ function buildPrompt(input: SuggestionRequest): string {
   }));
 
   const decisionSummary = summarizeDecisionContext(decisions, suspect);
+  const candidateTargets = buildCandidateTargetHints(
+    suspect,
+    components,
+    overlapping,
+    entityContext,
+    keyAnalysis,
+  );
 
   const payload = {
     task: 'Produce suggestions for a source/reference field decision flow.',
@@ -170,14 +179,20 @@ function buildPrompt(input: SuggestionRequest): string {
         '2) whether field references another model field (reference role)',
         'If both are "no", the field is scalar by definition (no extra modeling metadata).',
       ],
+      terminology: [
+        'API field: concrete field in one request/response payload scope.',
+        'Model field: canonical reusable schema field id in form Model.Field.',
+        'source=yes: API field is a model field on the current row/entity.',
+        'reference=yes: API field stores a pointer to another model field (usually OtherModel.Id).',
+      ],
       roleDefinitions: {
         source: [
-          'source=yes means this API field is itself a model field on the current entity.',
-          'The source target is where this field should live in canonical schema.',
+          'Use source=yes when this field belongs to the current entity shape.',
+          'For source=yes choose the canonical field where this value should live.',
         ],
         reference: [
-          'reference=yes means this API field points to another model field (relationship).',
-          'Reference target should usually be a different model field than source target.',
+          'Use reference=yes when this field points to another entity/model field.',
+          'Reference target should usually be a different model than source target.',
         ],
       },
       roleExamples: [
@@ -197,6 +212,12 @@ function buildPrompt(input: SuggestionRequest): string {
           reference: 'no',
         },
       ],
+      decisionRubric: [
+        'If key is exactly "Id" for the current row entity, prefer source=yes and reference=no.',
+        'If key ends with Id and sibling has same stem + Title/Name, relation evidence is stronger.',
+        'For reference=yes, prefer targets ending with ".Id" unless context clearly indicates another field.',
+        'Avoid source=yes + reference=yes unless there is explicit evidence for both roles.',
+      ],
       canonicalTargetFormat: 'Model.Field',
       canonicalTargetExamples: [
         'Material.ResponsibleCommittee',
@@ -212,6 +233,7 @@ function buildPrompt(input: SuggestionRequest): string {
         'If both are yes, source.yesPayload.fieldId and reference.yesPayload.fieldId must not be identical.',
         'For simple entity Id fields, reference is usually no unless relation evidence is explicit.',
         'Do not rely heavily on value-count statistics; use naming, path, and sibling semantics first.',
+        'When uncertain, prefer fewer assumptions (e.g., source yes + reference no).',
         'Use concise singular model names and PascalCase-like identifiers where possible.',
       ],
     },
@@ -223,8 +245,11 @@ function buildPrompt(input: SuggestionRequest): string {
       keyName: suspect.keyName,
       primitiveTypes: inferPrimitiveTypes(suspect.entry.values),
       valuePreview: values,
+      keySemantics: keyAnalysis,
+      entityContext,
     },
     siblingFields,
+    candidateTargets,
     existingModelFields: overlapping.map((entry) => ({
       fieldId: entry.id,
       baseType: entry.baseType,
@@ -244,6 +269,7 @@ function buildPrompt(input: SuggestionRequest): string {
         'Include payloads for both yes and no routes so UI can use suggestions regardless of user path.',
         'For source.yesPayload.fieldId and reference.yesPayload.fieldId, output canonical Model.Field only.',
         'Source and reference targets must represent different roles; do not reuse the exact same fieldId for both.',
+        'If reference is yes, its fieldId should typically end with ".Id".',
         'Never output method/path-based targets.',
         'Keep each reason under 120 characters.',
       ],
@@ -277,6 +303,133 @@ function buildSiblingFieldSnapshot(
       primitiveTypes: inferPrimitiveTypes(candidate.entry.values),
       sampleValues: Array.from(candidate.entry.values).slice(0, 6),
     }));
+}
+
+function analyzeKeyNameSemantics(
+  keyName: string,
+  siblingFields: Array<{ keyName: string }>,
+): {
+  raw: string;
+  stem: string;
+  suffix: string | null;
+  isExactId: boolean;
+  isLikelyReferenceKey: boolean;
+  siblingPairSignals: string[];
+} {
+  const suffix = detectKeySuffix(keyName) ?? null;
+  const stem = suggestSimpleFieldName(keyName);
+  const siblingNames = new Set(siblingFields.map((entry) => entry.keyName));
+  const siblingPairSignals: string[] = [];
+
+  if (stem && stem !== keyName) {
+    if (siblingNames.has(`${stem}Title`)) siblingPairSignals.push(`${stem}Title`);
+    if (siblingNames.has(`${stem}Name`)) siblingPairSignals.push(`${stem}Name`);
+    if (siblingNames.has(`${stem}Code`)) siblingPairSignals.push(`${stem}Code`);
+  }
+
+  return {
+    raw: keyName,
+    stem,
+    suffix,
+    isExactId: keyName === 'Id',
+    isLikelyReferenceKey: keyName.endsWith('Id') && keyName !== 'Id',
+    siblingPairSignals,
+  };
+}
+
+function inferEntityContext(suspect: Suspect): {
+  guessedEntityModel: string;
+  confidence: 'high' | 'medium' | 'low';
+  rationale: string;
+} {
+  const parentLooksLikeRows = suspect.parentPath === '[]' || suspect.parentPath.endsWith('[]');
+  const guessed = inferModelFromMethodName(suspect.methodName) ?? suggestModelName(suspect.keyName);
+  if (parentLooksLikeRows && guessed) {
+    return {
+      guessedEntityModel: guessed,
+      confidence: 'high',
+      rationale: 'Method and parent path look like entity rows.',
+    };
+  }
+  if (guessed) {
+    return {
+      guessedEntityModel: guessed,
+      confidence: 'medium',
+      rationale: 'Derived from method name and field naming.',
+    };
+  }
+  return {
+    guessedEntityModel: 'Entity',
+    confidence: 'low',
+    rationale: 'No clear method-level entity signal.',
+  };
+}
+
+function inferModelFromMethodName(methodName: string): string | undefined {
+  const trimmed = methodName.trim();
+  const match = trimmed.match(/^(?:Get|Set|Update|Create|Delete)(?:All|ById|By|For)?([A-Z].*)$/);
+  if (!match?.[1]) return undefined;
+
+  const candidate = match[1]
+    .replace(/(For|By|With).*/g, '')
+    .replace(/List$/g, '');
+
+  return singularizePascalCase(candidate);
+}
+
+function singularizePascalCase(value: string): string {
+  if (value.endsWith('ies') && value.length > 3) return `${value.slice(0, -3)}y`;
+  if (value.endsWith('ses') && value.length > 3) return value.slice(0, -2);
+  if (value.endsWith('s') && value.length > 1) return value.slice(0, -1);
+  return value;
+}
+
+function buildCandidateTargetHints(
+  suspect: Suspect,
+  components: SharedComponents,
+  overlapping: Array<{ id: string; baseType: string; overlapCount: number; sampleValues: Array<string | number | boolean> }>,
+  entityContext: { guessedEntityModel: string },
+  keyAnalysis: { stem: string; isLikelyReferenceKey: boolean },
+): {
+  sourceLikely: string[];
+  referenceLikely: string[];
+} {
+  const sourceLikely = new Set<string>();
+  const referenceLikely = new Set<string>();
+
+  sourceLikely.add(`${entityContext.guessedEntityModel}.${suspect.keyName}`);
+  sourceLikely.add(`${entityContext.guessedEntityModel}.${keyAnalysis.stem}`);
+
+  if (keyAnalysis.isLikelyReferenceKey && keyAnalysis.stem && keyAnalysis.stem !== suspect.keyName) {
+    referenceLikely.add(`${keyAnalysis.stem}.Id`);
+  }
+
+  for (const entry of overlapping) {
+    sourceLikely.add(entry.id);
+    if (entry.id.endsWith('.Id')) referenceLikely.add(entry.id);
+    const parsed = parseModelFieldId(entry.id);
+    if (!parsed) continue;
+    if (parsed.modelName !== entityContext.guessedEntityModel && entry.id.endsWith('.Id')) {
+      referenceLikely.add(entry.id);
+    }
+  }
+
+  for (const componentId of Object.keys(components)) {
+    if (componentId.endsWith('.Id')) {
+      const parsed = parseModelFieldId(componentId);
+      if (parsed && parsed.modelName !== entityContext.guessedEntityModel) {
+        referenceLikely.add(componentId);
+      }
+    }
+    if (componentId.startsWith(`${entityContext.guessedEntityModel}.`)) {
+      sourceLikely.add(componentId);
+    }
+  }
+
+  return {
+    sourceLikely: Array.from(sourceLikely).slice(0, 12),
+    referenceLikely: Array.from(referenceLikely).slice(0, 12),
+  };
 }
 
 function inferPrimitiveTypes(values: Set<string | number | boolean>): string[] {
@@ -314,10 +467,16 @@ function summarizeDecisionContext(
   decisions: Decisions,
   suspect: Suspect,
 ): {
+  decisionKindCounts: Record<FieldKind, number>;
   recentForSameKey: string[];
   recentForSameSuffix: string[];
 } {
-  const entries = parsedDecisionEntries(decisions);
+  const entries = parsedDecisionEntries(decisions).filter((entry) => (
+    !(entry.kind === 'source_reference'
+      && entry.sourceFieldId
+      && entry.referenceFieldId
+      && entry.sourceFieldId === entry.referenceFieldId)
+  ));
   const sameKeyName = entries
     .filter((entry) => entry.keyName === suspect.keyName)
     .slice(0, 8);
@@ -325,8 +484,18 @@ function summarizeDecisionContext(
   const suffixEntries = suffix
     ? entries.filter((entry) => entry.keyName.endsWith(suffix)).slice(0, 8)
     : [];
+  const decisionKindCounts: Record<FieldKind, number> = {
+    scalar: 0,
+    source: 0,
+    reference: 0,
+    source_reference: 0,
+  };
+  for (const entry of entries) {
+    decisionKindCounts[entry.kind]++;
+  }
 
   return {
+    decisionKindCounts,
     recentForSameKey: sameKeyName.map(formatDecisionExample),
     recentForSameSuffix: suffixEntries.map(formatDecisionExample),
   };
@@ -378,4 +547,14 @@ function suggestModelName(keyName: string): string {
   const parsed = suggestSimpleFieldName(keyName);
   if (parsed === keyName) return keyName;
   return parsed;
+}
+
+function parseModelFieldId(value: string | undefined): { modelName: string; fieldName: string } | null {
+  if (!value) return null;
+  const lastDot = value.lastIndexOf('.');
+  if (lastDot <= 0 || lastDot >= value.length - 1) return null;
+  const modelName = value.slice(0, lastDot).trim();
+  const fieldName = value.slice(lastDot + 1).trim();
+  if (!modelName || !fieldName) return null;
+  return { modelName, fieldName };
 }

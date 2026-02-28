@@ -10,9 +10,10 @@ import type {
 export const SUGGESTION_SYSTEM_PROMPT = [
   'You are assisting a schema-discovery CLI.',
   'Return only the structured object.',
+  'Distinguish API field scope from canonical Model.Field targets.',
   'Reason about two independent decisions: source-field and reference-field.',
-  'source=yes means the field is part of the current entity model.',
-  'reference=yes means the field points to another model field.',
+  'source=yes means the API field belongs to current entity row and maps to Model.Field.',
+  'reference=yes means the API field points to another model field (usually OtherModel.Id).',
   'Scalar is implied only when both decisions are "no".',
   'If both source and reference are yes, they must target different Model.Field values.',
   'Always provide yes/no payloads so the user can choose any path.',
